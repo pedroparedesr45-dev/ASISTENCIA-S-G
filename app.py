@@ -5,7 +5,11 @@ import calendar
 import io
 import json
 import os
+import smtplib
+import zipfile
+from email.message import EmailMessage
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import openpyxl
@@ -15,7 +19,27 @@ from openpyxl.drawing.image import Image as OpenPyxlImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image
-from streamlit_js_eval import get_geolocation
+from streamlit_js_eval import get_geolocation, streamlit_js_eval
+
+# --- ZONA HORARIA (evita el desfase de horas del servidor, que corre en UTC) ---
+ZONA_HORARIA_APP = ZoneInfo("America/Lima")
+
+
+def ahora_peru() -> datetime:
+    """Hora actual en la zona horaria de Perú (UTC-5), sin importar en qué
+    huso horario esté el servidor donde corre la app."""
+    return datetime.now(ZONA_HORARIA_APP)
+
+
+def hoy_peru() -> date:
+    """Fecha actual en la zona horaria de Perú."""
+    return ahora_peru().date()
+
+
+# Contraseña por defecto para empleados nuevos/de ejemplo. Configurable por
+# despliegue vía el secret PASSWORD_EMPLEADO_DEFAULT; si no se configura,
+# usa "123456" como respaldo.
+PASSWORD_EMPLEADO_DEFAULT = st.secrets.get("PASSWORD_EMPLEADO_DEFAULT", "123456")
 
 # --- CONEXIÓN SEGURA A SUPABASE (NUBE EFÍMERA) ---
 @st.cache_resource
@@ -96,14 +120,45 @@ st.set_page_config(
     page_icon="⏰",
 )
 
+st.markdown(
+    """
+    <link rel="icon" href="/app/static/icon-192.png">
+    <link rel="apple-touch-icon" href="/app/static/icon-192.png">
+    """,
+    unsafe_allow_html=True,
+)
+
 # --- MODO MÓVIL / TRABAJADOR (vista simplificada, solo marcación) ---
 # Se activa agregando ?modo=movil a la URL (opcionalmente también
-# ?empresa=CODIGO para pre-cargar la empresa). Pensado para instalarse
-# como PWA en el celular del trabajador.
+# ?empresa=CODIGO para pre-cargar la empresa) — usado por la PWA instalada
+# — O AUTOMÁTICAMENTE si se detecta que la pantalla es de tamaño celular.
 MODO_MOVIL = st.query_params.get("modo") == "movil"
 EMPRESA_URL = st.query_params.get("empresa")
 
-if MODO_MOVIL:
+if "ancho_pantalla_px" not in st.session_state:
+    st.session_state.ancho_pantalla_px = None
+
+_ancho_detectado = streamlit_js_eval(
+    js_expressions="window.innerWidth", key="ANCHO_PANTALLA_PX"
+)
+if _ancho_detectado is not None:
+    st.session_state.ancho_pantalla_px = _ancho_detectado
+
+# ES_CELULAR: el dispositivo físico es un celular (por ancho de pantalla o
+# por venir de la PWA), sin importar el rol de quien lo usa.
+ES_CELULAR = MODO_MOVIL or (
+    st.session_state.ancho_pantalla_px is not None
+    and st.session_state.ancho_pantalla_px < 768
+)
+
+# VISTA_TRABAJADOR_MOVIL: además de ser celular, la persona todavía no
+# inició sesión como Admin/SuperAdmin/Developer con PIN. Es la vista
+# simplificada de solo marcación (sin menú lateral ni panel admin).
+VISTA_TRABAJADOR_MOVIL = ES_CELULAR and not st.session_state.get(
+    "autenticado", False
+)
+
+if VISTA_TRABAJADOR_MOVIL:
     st.markdown(
         """
         <link rel="manifest" href="/app/static/manifest.json">
@@ -125,6 +180,7 @@ if MODO_MOVIL:
         """,
         unsafe_allow_html=True,
     )
+
 
 st.markdown(
     """
@@ -273,13 +329,13 @@ if "autenticado" not in st.session_state:
 if "rol" not in st.session_state:
     st.session_state.rol = None
 if "pin_admin" not in st.session_state:
-    st.session_state.pin_admin = "1234"
+    st.session_state.pin_admin = st.secrets.get("PIN_ADMIN", "1234")
 if "pin_visor" not in st.session_state:
-    st.session_state.pin_visor = "5678"
+    st.session_state.pin_visor = st.secrets.get("PIN_VISOR", "5678")
 if "pin_master" not in st.session_state:
-    st.session_state.pin_master = "9999"
+    st.session_state.pin_master = st.secrets.get("PIN_MASTER", "9999")
 if "clave_excel" not in st.session_state:
-    st.session_state.clave_excel = "admin123"
+    st.session_state.clave_excel = st.secrets.get("CLAVE_EXCEL", "admin123")
 if "fecha_inicio_sistema" not in st.session_state:
     st.session_state.fecha_inicio_sistema = date(2026, 1, 1)
 
@@ -434,6 +490,128 @@ def cargar_empresas():
         return df_init
 
 
+COLUMNAS_ASISTENCIA = [
+    "empresa_id",
+    "Fecha",
+    "Empleado",
+    "Tipo Marcación",
+    "Hora Registrada",
+    "Hora Entrada Oficial",
+    "Hora Salida Oficial",
+    "Estado",
+    "Minutos Tardanza",
+    "Horas Extra (min)",
+    "Sede Detectada",
+    "Distancia (m)",
+    "En Rango",
+    "Foto",
+]
+
+
+def sincronizar_marcaciones_nube(supabase, empresa_id):
+    """Trae desde Supabase las marcaciones de esta empresa de los últimos
+    días que aún no estén en el CSV local, y las agrega. Se llama cada vez
+    que se carga el panel; combinado con el auto-refresh del panel admin,
+    funciona como una sincronización 'casi en tiempo real' entre
+    dispositivos (celulares que marcan y laptops que monitorean)."""
+    if not supabase:
+        return
+    try:
+        if os.path.exists(CSV_ASISTENCIA):
+            df_local = pd.read_csv(CSV_ASISTENCIA)
+        else:
+            df_local = pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
+
+        desde = (hoy_peru() - timedelta(days=3)).strftime("%Y-%m-%d")
+        res = (
+            supabase.table("marcaciones_efimeras")
+            .select("*")
+            .eq("empresa_id", str(empresa_id))
+            .gte("fecha", desde)
+            .execute()
+        )
+        registros_nube = res.data or []
+        if not registros_nube:
+            return
+
+        existentes = set()
+        if not df_local.empty:
+            for _, r in df_local.iterrows():
+                existentes.add((
+                    str(r.get("Empleado", "")),
+                    str(r.get("Fecha", "")),
+                    str(r.get("Tipo Marcación", "")),
+                    str(r.get("Hora Registrada", "")),
+                ))
+
+        filas_nuevas = []
+        for reg in registros_nube:
+            clave = (
+                str(reg.get("nombre", "")),
+                str(reg.get("fecha", "")),
+                str(reg.get("tipo", "")),
+                str(reg.get("hora_registrada", "")),
+            )
+            if clave in existentes:
+                continue
+            filas_nuevas.append({
+                "empresa_id": reg.get("empresa_id", empresa_id),
+                "Fecha": reg.get("fecha", ""),
+                "Empleado": reg.get("nombre", ""),
+                "Tipo Marcación": reg.get("tipo", ""),
+                "Hora Registrada": reg.get("hora_registrada", ""),
+                "Hora Entrada Oficial": reg.get("hora_entrada_oficial", ""),
+                "Hora Salida Oficial": reg.get("hora_salida_oficial", ""),
+                "Estado": reg.get("estado", ""),
+                "Minutos Tardanza": reg.get("minutos_tardanza", 0),
+                "Horas Extra (min)": reg.get("horas_extra_min", 0),
+                "Sede Detectada": reg.get("sede_detectada", ""),
+                "Distancia (m)": reg.get("distancia_m", 0.0),
+                "En Rango": reg.get("en_rango", ""),
+                "Foto": reg.get("foto_url", ""),
+            })
+
+        if filas_nuevas:
+            df_local = pd.concat(
+                [df_local, pd.DataFrame(filas_nuevas)], ignore_index=True
+            )
+            df_local.to_csv(CSV_ASISTENCIA, index=False)
+    except Exception:
+        pass  # si falla la sincronización, se sigue mostrando lo que ya había local
+
+
+def enviar_backup_email(asunto, cuerpo, adjuntos):
+    """Envía un correo con el respaldo adjunto a la dirección del developer
+    configurada en los Secrets de Streamlit. `adjuntos` es una lista de
+    tuplas (nombre_archivo, bytes, tipo_mime)."""
+    remitente = st.secrets.get("EMAIL_REMITENTE")
+    clave_app = st.secrets.get("EMAIL_APP_PASSWORD")
+    destino = st.secrets.get("EMAIL_DESTINO_DEVELOPER")
+
+    if not remitente or not clave_app or not destino:
+        raise RuntimeError(
+            "Faltan los secrets EMAIL_REMITENTE, EMAIL_APP_PASSWORD o "
+            "EMAIL_DESTINO_DEVELOPER en la configuración de Streamlit."
+        )
+
+    msg = EmailMessage()
+    msg["Subject"] = asunto
+    msg["From"] = remitente
+    msg["To"] = destino
+    msg.set_content(cuerpo)
+
+    for nombre, contenido, tipo_mime in adjuntos:
+        maintype, subtype = tipo_mime.split("/", 1)
+        msg.add_attachment(
+            contenido, maintype=maintype, subtype=subtype, filename=nombre
+        )
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(remitente, clave_app)
+        server.send_message(msg)
+
+
 def cargar_datos(empresa_id):
     cargar_empresas()
 
@@ -482,7 +660,7 @@ def cargar_datos(empresa_id):
             ].apply(lambda x: json.dumps([x]) if pd.notna(x) else "[]")
 
         if "password" not in df_empleados.columns:
-            df_empleados["password"] = "123456"
+            df_empleados["password"] = PASSWORD_EMPLEADO_DEFAULT
         if "horario_personalizado" not in df_empleados.columns:
             df_empleados["horario_personalizado"] = "{}"
         if "fecha_ingreso" not in df_empleados.columns:
@@ -502,11 +680,13 @@ def cargar_datos(empresa_id):
                 json.dumps(["OFICINA PRINCIPAL"]),
             ],
             "cargo": ["PRACTICANTE CONTABLE", "ASISTENTE DE VENTAS"],
-            "password": ["123456", "123456"],
+            "password": [PASSWORD_EMPLEADO_DEFAULT, PASSWORD_EMPLEADO_DEFAULT],
             "horario_personalizado": ["{}", "{}"],
             "fecha_ingreso": ["2026-01-01", "2026-01-01"],
         })
         df_empleados.to_csv(CSV_EMPLEADOS, index=False)
+
+    sincronizar_marcaciones_nube(supabase, empresa_id)
 
     if os.path.exists(CSV_ASISTENCIA):
         df_asistencia = pd.read_csv(CSV_ASISTENCIA)
@@ -545,7 +725,7 @@ def cargar_datos(empresa_id):
 
 
 # BARRA LATERAL: ENTORNO Y CAMBIO RÁPIDO
-if not MODO_MOVIL:
+if not VISTA_TRABAJADOR_MOVIL:
     st.sidebar.title("📌 Menú Principal")
 
     entorno_sel = st.sidebar.radio(
@@ -1254,12 +1434,12 @@ if st.session_state.emp_login_ok and not st.session_state.autenticado:
         unsafe_allow_html=True,
     )
 
-if st.session_state.entorno == "DEV" and not MODO_MOVIL:
+if st.session_state.entorno == "DEV" and not VISTA_TRABAJADOR_MOVIL:
     st.sidebar.warning(
         "⚠️ Entorno de Desarrollo Activo (Solo empresas Sandbox)"
     )
 
-if MODO_MOVIL:
+if VISTA_TRABAJADOR_MOVIL:
     opcion = "⏰ Marcar Asistencia"
 else:
     opcion = st.sidebar.radio(
@@ -1275,8 +1455,44 @@ else:
 
 if opcion == "⏰ Marcar Asistencia":
     st.title("⏰ Registro de Asistencia por GPS")
-    hoy = date.today()
-    st.write(f"**Fecha actual:** {datetime.now().strftime('%d/%m/%Y')}")
+    hoy = hoy_peru()
+    st.write(f"**Fecha actual:** {ahora_peru().strftime('%d/%m/%Y')}")
+
+    if VISTA_TRABAJADOR_MOVIL:
+        with st.expander("🔐 ¿Eres Admin, SuperAdmin o Developer?"):
+            df_e_disponibles_mov = cargar_empresas()
+            df_e_disponibles_mov = df_e_disponibles_mov[
+                df_e_disponibles_mov["entorno"] == st.session_state.entorno
+            ]
+            empresa_admin_mov = st.selectbox(
+                "Empresa:",
+                df_e_disponibles_mov["empresa_id"].unique()
+                if not df_e_disponibles_mov.empty
+                else [],
+                key="empresa_admin_movil",
+            )
+            pin_mov = st.text_input(
+                "PIN de Acceso:", type="password", key="pin_admin_movil"
+            )
+            if st.button("Ingresar al Panel", key="btn_login_admin_movil"):
+                if empresa_admin_mov:
+                    st.session_state.empresa_id = empresa_admin_mov
+                    if pin_mov == st.session_state.pin_admin:
+                        st.session_state.autenticado = True
+                        st.session_state.rol = "admin"
+                        st.rerun()
+                    elif pin_mov == st.session_state.pin_visor:
+                        st.session_state.autenticado = True
+                        st.session_state.rol = "visor"
+                        st.rerun()
+                    elif pin_mov == st.session_state.pin_master:
+                        st.session_state.autenticado = True
+                        st.session_state.rol = "master"
+                        st.rerun()
+                    else:
+                        st.error("PIN Incorrecto.")
+                else:
+                    st.error("No hay empresas disponibles en este entorno.")
 
     if not st.session_state.emp_login_ok:
         st.markdown("### 🔑 Iniciar Sesión de Empleado")
@@ -1440,7 +1656,7 @@ if opcion == "⏰ Marcar Asistencia":
                 )
 
             if st.button("Confirmar Marcación", disabled=btn_disabled):
-                now = datetime.now()
+                now = ahora_peru().replace(tzinfo=None)
                 fecha_str = now.strftime("%Y-%m-%d")
                 hora_str = now.strftime("%H:%M:%S")
 
@@ -1618,6 +1834,10 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             else:
                 st.error("No hay empresas disponibles en este entorno.")
     else:
+        from streamlit_autorefresh import st_autorefresh
+
+        st_autorefresh(interval=10_000, key="admin_autorefresh")
+
         st.title(
             f"⚙️ Control Administrativo - [{st.session_state.empresa_id}]"
             f" ({st.session_state.entorno})"
@@ -1633,7 +1853,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             or st.session_state.entorno == "DEV"
         )
 
-        if st.session_state.rol in ["admin", "master"]:
+        if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
             if es_master_o_dev:
                 tab_gestion_nombre = "🏢 Gestión de Empresas y Sedes"
             else:
@@ -1644,6 +1864,12 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 "👥 Personal",
                 "⚙️ Ajustes",
             ])
+        elif st.session_state.rol in ["admin", "master"] and ES_CELULAR:
+            st.caption(
+                "📱 Estás viendo la versión móvil: solo reportes. Entra "
+                "desde una laptop/PC para gestionar empresas, personal y"
+                " ajustes."
+            )
 
         tab_objs = st.tabs(tabs)
 
@@ -1655,7 +1881,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 mes_nombre_sel = st.selectbox(
                     "Mes Evaluado:",
                     list(MESES_NOMBRES.values()),
-                    index=datetime.now().month - 1,
+                    index=ahora_peru().month - 1,
                 )
                 mes_sel = MESES_INVERSO[mes_nombre_sel]
             with c_f2:
@@ -1663,7 +1889,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     "Año Evaluado:",
                     min_value=2024,
                     max_value=2030,
-                    value=datetime.now().year,
+                    value=ahora_peru().year,
                 )
             with c_f3:
                 st.write("")
@@ -1827,7 +2053,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 mes_ind_sel = st.selectbox(
                     "Mes:",
                     list(MESES_NOMBRES.values()),
-                    index=datetime.now().month - 1,
+                    index=ahora_peru().month - 1,
                     key="m_ind_clean",
                 )
             with c_e3:
@@ -1835,7 +2061,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     "Año:",
                     min_value=2024,
                     max_value=2030,
-                    value=datetime.now().year,
+                    value=ahora_peru().year,
                     key="a_ind_clean",
                 )
 
@@ -1866,7 +2092,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 es_autorizado_edicion = (
                     st.session_state.rol in ["admin", "master"]
                     or st.session_state.entorno == "DEV"
-                )
+                ) and not ES_CELULAR
 
                 if es_autorizado_edicion:
                     with st.expander(
@@ -1901,7 +2127,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     if os.path.exists(CSV_ASISTENCIA)
                                     else pd.DataFrame()
                                 )
-                                hoy_actual = date.today()
+                                hoy_actual = hoy_peru()
                                 h_ent_ofic, h_sal_ofic = (
                                     obtener_horario_oficial(
                                         emp_info, df_sedes, hoy_actual
@@ -2249,7 +2475,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 )
 
                 lista_registros_completos = []
-                hoy_eval = date.today()
+                hoy_eval = hoy_peru()
 
                 for d in range(1, num_dias_m + 1):
                     f_curr = date(anio_ind_sel, m_num, d)
@@ -2327,7 +2553,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         " este mes."
                     )
 
-        if st.session_state.rol in ["admin", "master"]:
+        if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
             with tab_objs[2]:
                 if es_master_o_dev:
                     st.subheader("🏢 Gestión Integral de Empresas y Sedes SaaS")
@@ -2428,14 +2654,14 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         except Exception:
                             val_sed_a = [val_sed_p] if val_sed_p else []
 
-                        val_pas = str(datos_e.get("password", "123456"))
+                        val_pas = str(datos_e.get("password", PASSWORD_EMPLEADO_DEFAULT))
                     else:
                         val_dni = ""
                         val_nom = ""
                         val_car = ""
                         val_sed_p = sedes_lista[0] if sedes_lista else ""
                         val_sed_a = sedes_lista.copy()
-                        val_pas = "123456"
+                        val_pas = PASSWORD_EMPLEADO_DEFAULT
 
                     default_sedes_validas = [
                         s for s in val_sed_a if s in sedes_lista
@@ -2566,7 +2792,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             "password": e_pass,
                                             "horario_personalizado": "{}",
                                             "fecha_ingreso": (
-                                                date.today().strftime(
+                                                hoy_peru().strftime(
                                                     "%Y-%m-%d"
                                                 )
                                             ),
@@ -2743,77 +2969,248 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 with subtab_respaldo:
                     st.markdown("#### ☁️ Panel Maestro de SuperAdmin / Respaldo")
                     st.caption(
-                        "Sincronización, Respaldo Histórico Silencioso y"
-                        " Vaciado de Nube Efímera."
+                        "Sincronización, Respaldo Histórico y Vaciado de"
+                        " Nube Efímera."
+                    )
+
+                    st.info(
+                        "📋 **Cómo funciona este respaldo:** al generarlo, "
+                        "se prepara un archivo .zip (Excel + fotos) para "
+                        "que lo descargues a esta computadora, **y se envía "
+                        "automáticamente una copia por correo al equipo que "
+                        "da soporte y mantenimiento a este sistema**, como "
+                        "parte del servicio. Recién después de que confirmes "
+                        "que ya descargaste el archivo, se eliminan esos "
+                        "registros de la nube para mantenerte dentro del "
+                        "plan gratuito de Supabase."
                     )
 
                     st.markdown(
-                        "**Sincronizar Marcaciones Globales / Empresa Activa:**"
-                        f" `{st.session_state.empresa_id}`"
+                        "**Empresa activa:** "
+                        f"`{st.session_state.empresa_id}`"
                     )
 
-                    if st.button("⚡ Ejecutar Sincronización, Copia de Seguridad y Limpieza Nube", use_container_width=True):
-                        if supabase:
-                            try:
-                                # 1. Consultar registros no descargados por el Master
-                                res = supabase.table("marcaciones_efimeras").select("*").eq("descargado_master", False).execute()
-                                registros_nuevos = res.data
+                    if "backup_listo" not in st.session_state:
+                        st.session_state.backup_listo = False
+                        st.session_state.backup_zip_bytes = None
+                        st.session_state.backup_ids_a_borrar = []
+                        st.session_state.backup_fotos_a_borrar = []
+                        st.session_state.backup_email_ok = False
 
-                                if registros_nuevos:
-                                    os.makedirs("backup_fotos_master", exist_ok=True)
-                                    df_asist_local = pd.read_csv(CSV_ASISTENCIA) if os.path.exists(CSV_ASISTENCIA) else pd.DataFrame()
-
-                                    nuevos_locales = []
-
-                                    for item in registros_nuevos:
-                                        foto_nombre = item.get("foto_url")
-                                        path_foto_local = ""
-
-                                        # 2. Descargar Foto a Laptop Master y Eliminar del Bucket Nube
-                                        if foto_nombre:
-                                            try:
-                                                data_foto = supabase.storage.from_("fotos-asistencia").download(foto_nombre)
-                                                path_foto_local = os.path.join("backup_fotos_master", foto_nombre)
-                                                with open(path_foto_local, "wb") as f:
-                                                    f.write(data_foto)
-                                                
-                                                # Eliminar foto de la nube inmediatamente para mantener $0 costo
-                                                supabase.storage.from_("fotos-asistencia").remove([foto_nombre])
-                                            except Exception as err_foto:
-                                                st.write(f"Aviso foto {foto_nombre}: {err_foto}")
-
-                                        # 3. Integrar marcación al CSV local maestro mapeando llaves correctamente
-                                        nueva_m = {
-                                            "empresa_id": item.get("empresa_id"),
-                                            "Fecha": item.get("fecha"),
-                                            "Empleado": item.get("nombre"),
-                                            "Tipo Marcación": item.get("tipo"),
-                                            "Hora Registrada": item.get("hora_registrada"),
-                                            "Hora Entrada Oficial": item.get("hora_entrada_oficial"),
-                                            "Hora Salida Oficial": item.get("hora_salida_oficial"),
-                                            "Estado": item.get("estado"),
-                                            "Minutos Tardanza": item.get("minutos_tardanza", 0),
-                                            "Horas Extra (min)": item.get("horas_extra_min", 0),
-                                            "Sede Detectada": item.get("sede_detectada"),
-                                            "Distancia (m)": item.get("distancia_m", 0.0),
-                                            "En Rango": item.get("en_rango", "SÍ"),
-                                            "Foto": path_foto_local if path_foto_local else foto_nombre
-                                        }
-                                        nuevos_locales.append(nueva_m)
-
-                                        # Marca como sincronizado en la base remota
-                                        supabase.table("marcaciones_efimeras").update({"descargado_master": True}).eq("id", item["id"]).execute()
-
-                                    df_asist_local = pd.concat([df_asist_local, pd.DataFrame(nuevos_locales)], ignore_index=True)
-                                    df_asist_local.to_csv(CSV_ASISTENCIA, index=False)
-                                    st.success(f"¡Sincronización completada! Se descargaron e integraron {len(registros_nuevos)} nuevos registros.")
-                                    st.rerun()
-                                else:
-                                    st.info("No hay marcaciones nuevas pendientes de sincronizar en la Nube.")
-                            except Exception as e_sync:
-                                st.error(f"Error al sincronizar con Supabase: {e_sync}")
+                    if st.button(
+                        "1️⃣ Generar Respaldo (local + copia por correo)",
+                        use_container_width=True,
+                        disabled=st.session_state.backup_listo,
+                    ):
+                        if not supabase:
+                            st.warning(
+                                "El cliente Supabase no está configurado."
+                            )
                         else:
-                            st.warning("El cliente Supabase no está configurado.")
+                            try:
+                                res = (
+                                    supabase.table("marcaciones_efimeras")
+                                    .select("*")
+                                    .eq(
+                                        "empresa_id",
+                                        str(st.session_state.empresa_id),
+                                    )
+                                    .eq("descargado_master", False)
+                                    .execute()
+                                )
+                                registros = res.data or []
+
+                                if not registros:
+                                    st.info(
+                                        "No hay marcaciones nuevas"
+                                        " pendientes de respaldo."
+                                    )
+                                else:
+                                    df_export = pd.DataFrame([
+                                        {
+                                            "Fecha": r.get("fecha"),
+                                            "Empleado": r.get("nombre"),
+                                            "DNI": r.get("dni"),
+                                            "Tipo": r.get("tipo"),
+                                            "Hora Registrada": r.get(
+                                                "hora_registrada"
+                                            ),
+                                            "Estado": r.get("estado"),
+                                            "Minutos Tardanza": r.get(
+                                                "minutos_tardanza", 0
+                                            ),
+                                            "Horas Extra (min)": r.get(
+                                                "horas_extra_min", 0
+                                            ),
+                                            "Sede Detectada": r.get(
+                                                "sede_detectada"
+                                            ),
+                                            "Distancia (m)": r.get(
+                                                "distancia_m", 0.0
+                                            ),
+                                            "En Rango": r.get("en_rango"),
+                                            "Foto": r.get("foto_url"),
+                                        }
+                                        for r in registros
+                                    ])
+
+                                    buffer_excel = io.BytesIO()
+                                    df_export.to_excel(
+                                        buffer_excel,
+                                        index=False,
+                                        engine="openpyxl",
+                                    )
+                                    buffer_excel.seek(0)
+
+                                    buffer_zip = io.BytesIO()
+                                    fotos_ok = []
+                                    with zipfile.ZipFile(
+                                        buffer_zip,
+                                        "w",
+                                        zipfile.ZIP_DEFLATED,
+                                    ) as zf:
+                                        zf.writestr(
+                                            f"asistencia_{st.session_state.empresa_id}.xlsx",
+                                            buffer_excel.getvalue(),
+                                        )
+                                        for r in registros:
+                                            foto_nombre = r.get("foto_url")
+                                            if not foto_nombre:
+                                                continue
+                                            try:
+                                                data_foto = supabase.storage.from_(
+                                                    "fotos-asistencia"
+                                                ).download(foto_nombre)
+                                                zf.writestr(
+                                                    f"fotos/{foto_nombre}",
+                                                    data_foto,
+                                                )
+                                                fotos_ok.append(foto_nombre)
+                                            except Exception as err_foto:
+                                                st.caption(
+                                                    "⚠️ No se pudo incluir"
+                                                    f" la foto {foto_nombre}:"
+                                                    f" {err_foto}"
+                                                )
+
+                                    buffer_zip.seek(0)
+                                    zip_bytes = buffer_zip.getvalue()
+
+                                    try:
+                                        enviar_backup_email(
+                                            asunto=(
+                                                "Respaldo asistencia - "
+                                                f"{st.session_state.empresa_id}"
+                                                f" - {hoy_peru()}"
+                                            ),
+                                            cuerpo=(
+                                                f"Respaldo automático de"
+                                                f" {len(registros)} registros"
+                                                " de la empresa"
+                                                f" {st.session_state.empresa_id}."
+                                            ),
+                                            adjuntos=[(
+                                                f"respaldo_{st.session_state.empresa_id}_{hoy_peru()}.zip",
+                                                zip_bytes,
+                                                "application/zip",
+                                            )],
+                                        )
+                                        email_ok = True
+                                    except Exception as err_email:
+                                        email_ok = False
+                                        st.error(
+                                            "⚠️ No se pudo enviar la copia"
+                                            f" por correo: {err_email}"
+                                        )
+
+                                    st.session_state.backup_listo = True
+                                    st.session_state.backup_zip_bytes = (
+                                        zip_bytes
+                                    )
+                                    st.session_state.backup_ids_a_borrar = [
+                                        r["id"] for r in registros
+                                    ]
+                                    st.session_state.backup_fotos_a_borrar = (
+                                        fotos_ok
+                                    )
+                                    st.session_state.backup_email_ok = (
+                                        email_ok
+                                    )
+                                    st.success(
+                                        "✅ Respaldo generado con"
+                                        f" {len(registros)} registros."
+                                        + (
+                                            " Copia enviada por correo."
+                                            if email_ok
+                                            else " (la copia por correo"
+                                            " falló, revisa el aviso"
+                                            " de arriba)"
+                                        )
+                                    )
+                            except Exception as e_sync:
+                                st.error(
+                                    "Error al generar el respaldo:"
+                                    f" {e_sync}"
+                                )
+
+                    if (
+                        st.session_state.backup_listo
+                        and st.session_state.backup_zip_bytes
+                    ):
+                        st.download_button(
+                            "⬇️ Descargar respaldo a esta computadora",
+                            data=st.session_state.backup_zip_bytes,
+                            file_name=(
+                                f"respaldo_{st.session_state.empresa_id}"
+                                f"_{hoy_peru()}.zip"
+                            ),
+                            mime="application/zip",
+                            use_container_width=True,
+                        )
+
+                        st.warning(
+                            "⚠️ Antes de continuar, asegúrate de haber"
+                            " descargado y guardado el archivo .zip en un"
+                            " lugar seguro. El siguiente paso es"
+                            " IRREVERSIBLE: borra estos registros de la"
+                            " nube."
+                        )
+
+                        if st.button(
+                            "2️⃣ Ya descargué el respaldo — Limpiar la Nube",
+                            use_container_width=True,
+                            type="primary",
+                        ):
+                            try:
+                                ids = st.session_state.backup_ids_a_borrar
+                                fotos = (
+                                    st.session_state.backup_fotos_a_borrar
+                                )
+
+                                if fotos:
+                                    supabase.storage.from_(
+                                        "fotos-asistencia"
+                                    ).remove(fotos)
+
+                                for rid in ids:
+                                    supabase.table(
+                                        "marcaciones_efimeras"
+                                    ).delete().eq("id", rid).execute()
+
+                                st.session_state.backup_listo = False
+                                st.session_state.backup_zip_bytes = None
+                                st.session_state.backup_ids_a_borrar = []
+                                st.session_state.backup_fotos_a_borrar = []
+
+                                st.success(
+                                    f"🧹 Nube limpiada: {len(ids)} registros"
+                                    f" y {len(fotos)} fotos eliminados."
+                                )
+                                st.rerun()
+                            except Exception as e_purge:
+                                st.error(
+                                    f"Error al limpiar la nube: {e_purge}"
+                                )
 
                 with subtab_seguridad:
                     st.markdown("#### 🔑 Administración de Claves de Acceso")
