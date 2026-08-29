@@ -1,0 +1,27 @@
+{
+    "pin_admin": "1234",
+    "radio_maximo_metros": 50,
+    "hora_entrada": "08:00:00",
+    "sedes": {
+        "CASA ADMIN": {
+            "lat": -8.098136,
+            "lon": -79.044773,
+            "hora_entrada": "08:00:00"
+        },
+        "OFICINA PRINCIPAL": {
+            "lat": -8.114546,
+            "lon": -79.018131,
+            "hora_entrada": "08:00:00"
+        },
+        "TIENDA SUAREZ S&G": {
+            "lat": -8.114654,
+            "lon": -79.018363,
+            "hora_entrada": "07:30:00"
+        },
+        "TIENDA BALBOA INNOVACEROS": {
+            "lat": -8.113673,
+            "lon": -79.017844,
+            "hora_entrada": "07:30:00"
+        }
+    }
+}
