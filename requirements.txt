@@ -1,0 +1,10 @@
+streamlit
+streamlit-autorefresh
+supabase
+pandas
+numpy
+openpyxl
+plotly
+Pillow
+streamlit-js-eval
+tzdata
