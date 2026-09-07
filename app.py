@@ -1942,6 +1942,25 @@ def cargar_todos_honorarios_supabase(supabase, empresa_id):
         return None
 
 
+def filtrar_recibos_vigentes(df_honorarios):
+    """Descarta los recibos ANULADOS o REVERTIDOS (columna 'estado' del
+    .txt de SUNAT) — nunca se cuentan en totales, reportes, ni en los
+    archivos que se presentan a SUNAT (AFPnet/PLAME). Si el estado no
+    es reconocible (vacío o un valor inesperado), se conserva el
+    recibo por seguridad, para no descartar algo válido por error."""
+    if df_honorarios is None or df_honorarios.empty or "estado" not in df_honorarios.columns:
+        return df_honorarios
+    estado_norm = df_honorarios["estado"].astype(str).str.strip().str.upper()
+    es_invalido = estado_norm.str.contains("ANULAD") | estado_norm.str.contains(
+        "REVERTID"
+    )
+    # "NO ANULADO" contiene la palabra "ANULAD", así que se corrige
+    # aparte para no descartarlo por error.
+    es_no_anulado = estado_norm.str.contains("NO ANULAD")
+    excluir = es_invalido & ~es_no_anulado
+    return df_honorarios[~excluir].copy()
+
+
 # --- PLAME para Recibos por Honorarios: PDT PLAME importa 2 archivos
 # de TEXTO PLANO (no Excel), separados por "|", con nombre de archivo
 # obligatorio: "0601" + AAAAMM (período) + RUC + extensión.
@@ -1992,7 +2011,12 @@ def generar_plame_honorarios_ps4(df_honorarios):
     7 campos separados por '|', sin encabezado:
     1) Tipo doc. (Tabla 3) 2) N° documento 3) Apellido paterno
     4) Apellido materno 5) Nombres 6) Domiciliado (1=Sí/2=No)
-    7) Convenio doble tributación (Tabla 25, 0=Ninguno)."""
+    7) Convenio doble tributación (Tabla 25, 0=Ninguno).
+
+    IMPORTANTE (confirmado byte a byte contra un archivo real generado
+    por la macro oficial de SUNAT): cada línea lleva una BARRA "|"
+    ADICIONAL al final, después del campo 7 — no está en la
+    documentación de campos, pero sin ella PLAME la rechaza."""
     df_unicos = df_honorarios.drop_duplicates(subset=["nro_doc_emisor"])
     lineas = []
     for _, fila in df_unicos.iterrows():
@@ -2007,6 +2031,7 @@ def generar_plame_honorarios_ps4(df_honorarios):
             nombres,
             "1",  # Domiciliado: se asume Sí por defecto
             "0",  # Convenio doble tributación: Ninguno por defecto
+            "",  # columna extra vacía al final (confirmada en archivo real)
         ]
         lineas.append("|".join(campos))
     return "\r\n".join(lineas)
@@ -2019,10 +2044,19 @@ def generar_plame_honorarios_4ta(df_honorarios):
     por Honorarios) 4) Serie 5) Número 6) Monto total del servicio
     7) Fecha de emisión (dd/mm/aaaa) 8) Fecha de pago (dd/mm/aaaa)
     9) Indicador Retención 4ta (1=Sí/0=No) 10) Indicador Retención
-    Régimen Pensionario (1=ONP/2=SPP/3=Sin retención) 11) Importe del
-    aporte al Régimen Pensionario (vacío si el campo 10 es 3 — no
-    manejamos aportes pensionarios de prestadores en este sistema, así
-    que siempre se envía 3 y este campo va vacío)."""
+    Régimen Pensionario 11) Importe del aporte al Régimen Pensionario.
+
+    CAMPO 10 — CONFIRMADO CON UN CASO REAL RECHAZADO Y CORREGIDO POR EL
+    USUARIO: aunque la tabla de referencia de SUNAT dice que "3" es un
+    valor válido para "Sin retención / No aplica", en la práctica PLAME
+    lo RECHAZA — hay que dejarlo VACÍO cuando no hay retención de
+    régimen pensionario, no poner "3". No manejamos aportes
+    pensionarios de prestadores en este sistema, así que este campo
+    siempre va vacío (y el campo 11 también, por la misma razón).
+
+    IMPORTANTE (confirmado byte a byte contra un archivo real generado
+    por la macro oficial de SUNAT): cada línea también lleva una BARRA
+    "|" ADICIONAL al final, después del campo 11."""
     lineas = []
     for _, fila in df_honorarios.iterrows():
         impuesto = float(fila.get("impuesto_renta", 0) or 0)
@@ -2037,8 +2071,9 @@ def generar_plame_honorarios_4ta(df_honorarios):
             str(fila.get("fecha_emision", "")),
             str(fila.get("fecha_emision", "")),  # fecha de pago (no la registramos aparte; se usa la de emisión)
             indicador_retencion_4ta,
-            "3",  # Sin retención de régimen pensionario / no aplica
-            "",  # vacío porque el campo 10 es 3
+            "",  # Retención régimen pensionario: VACÍO, no "3" (ver nota arriba)
+            "",  # Importe del aporte: vacío, va junto con el campo 10
+            "",  # columna extra vacía al final (confirmada en archivo real)
         ]
         lineas.append("|".join(campos))
     return "\r\n".join(lineas)
@@ -8863,7 +8898,15 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         " período."
                     )
                 else:
-                    df_hon_vista = pd.DataFrame(registros_hon)
+                    df_hon_vista_todo = pd.DataFrame(registros_hon)
+                    df_hon_vista = filtrar_recibos_vigentes(df_hon_vista_todo)
+                    n_excluidos = len(df_hon_vista_todo) - len(df_hon_vista)
+                    if n_excluidos > 0:
+                        st.caption(
+                            f"ℹ️ Se excluyeron {n_excluidos} recibo(s)"
+                            " anulados/revertidos — no se cuentan en"
+                            " ningún total ni archivo."
+                        )
 
                     col_hm1, col_hm2, col_hm3 = st.columns(3)
                     col_hm1.metric("Recibos", len(df_hon_vista))
@@ -8950,7 +8993,9 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                 razon_social_c, ruc_c = _obtener_datos_empresa(
                                     df_empresas
                                 )
-                                df_todos_hon = pd.DataFrame(registros_todos)
+                                df_todos_hon = filtrar_recibos_vigentes(
+                                    pd.DataFrame(registros_todos)
+                                )
                                 excel_consolidado = generar_excel_honorarios(
                                     df_todos_hon, razon_social_c, ruc_c,
                                     "Consolidado — todos los períodos",
