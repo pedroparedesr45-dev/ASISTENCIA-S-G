@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 import base64
 import calendar
@@ -305,6 +306,104 @@ def clave_coincide(valor_ingresado, valor_guardado):
     return str(valor_ingresado) == valor_guardado
 
 
+def render_sonido(tonos):
+    """Reproduce un sonido corto generado con Web Audio API — sin
+    archivos de audio, sin librerías externas.
+
+    POR QUÉ ESTO SÍ ES SEGURO (a diferencia del intento anterior que
+    rompía la página): el sonido no necesita verse en ningún lado, así
+    que no hace falta inyectar nada en la página principal, ni estirar
+    un iframe a pantalla completa, ni limpiar overlays después — el
+    iframe minúsculo e invisible que usa `st.components.v1.html()`
+    simplemente vive y muere con el ciclo normal de Streamlit (se
+    reemplaza solo en el siguiente rerun, como cualquier otro
+    elemento), sin dejar nada pegado en pantalla. Todo lo que causaba
+    los bugs anteriores (temblor de pantalla, confetti por JS, inyectar
+    HTML en window.parent.document) queda fuera — esto es solo sonido.
+
+    'tonos' es una lista de tuplas (frecuencia_hz, duración_seg,
+    retraso_ms), ej. [(660, 0.12, 0), (880, 0.18, 100)]."""
+    lineas_tonos = []
+    for freq, dur, delay in tonos:
+        lineas_tonos.append(f"""
+        setTimeout(function(){{
+            try{{
+                var ctx = new (window.AudioContext||window.webkitAudioContext)();
+                var o = ctx.createOscillator(), g = ctx.createGain();
+                o.type = 'sine'; o.frequency.value = {freq};
+                g.gain.setValueAtTime(0.15, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + {dur});
+                o.connect(g); g.connect(ctx.destination);
+                o.start(); o.stop(ctx.currentTime + {dur});
+            }}catch(e){{}}
+        }}, {delay});
+        """)
+    html = f"""
+    <script>
+    (function(){{
+        {''.join(lineas_tonos)}
+    }})();
+    </script>
+    """
+    components.html(html, height=0)
+
+
+def render_sonido_sello(delay_ms=200, grave=True):
+    """Sonido sintetizado de "sello golpeando papel" — un chasquido de
+    ruido corto (el "clack" del golpe) combinado con un tono grave que
+    cae rápido (el "thump" del impacto), generado 100% con Web Audio
+    API (sin archivos de audio). Mismo mecanismo seguro que
+    render_sonido(): no toca nada visual, solo reproduce sonido.
+
+    'grave' en False baja un poco el tono para diferenciar una
+    Tardanza (menos "triunfal") de un registro Puntual."""
+    frecuencia_inicial = 190 if grave else 150
+    frecuencia_final = 45 if grave else 35
+    html = f"""
+    <script>
+    (function(){{
+        setTimeout(function(){{
+            try{{
+                var ctx = new (window.AudioContext||window.webkitAudioContext)();
+
+                // El "clack" — un chasquido corto de ruido blanco.
+                var duracionRuido = 0.035;
+                var tamano = Math.floor(ctx.sampleRate * duracionRuido);
+                var buffer = ctx.createBuffer(1, tamano, ctx.sampleRate);
+                var datos = buffer.getChannelData(0);
+                for (var i = 0; i < tamano; i++) {{
+                    datos[i] = (Math.random() * 2 - 1) * (1 - i / tamano);
+                }}
+                var ruido = ctx.createBufferSource();
+                ruido.buffer = buffer;
+                var gananciaRuido = ctx.createGain();
+                gananciaRuido.gain.setValueAtTime(0.35, ctx.currentTime);
+                ruido.connect(gananciaRuido);
+                gananciaRuido.connect(ctx.destination);
+                ruido.start();
+
+                // El "thump" — un golpe grave que cae rápido de frecuencia.
+                var osc = ctx.createOscillator();
+                var g = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime({frecuencia_inicial}, ctx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(
+                    {frecuencia_final}, ctx.currentTime + 0.15
+                );
+                g.gain.setValueAtTime(0.5, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+                osc.connect(g);
+                g.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.28);
+            }}catch(e){{}}
+        }}, {delay_ms});
+    }})();
+    </script>
+    """
+    components.html(html, height=0)
+
+
 def render_html(html):
     """Renderiza HTML/CSS crudo con st.markdown de forma segura.
 
@@ -364,6 +463,188 @@ Al marcar la casilla de abajo, declaras haber leído este aviso y
 otorgas tu consentimiento expreso para el tratamiento de tu foto y tu
 ubicación GPS con la única finalidad descrita.
 """
+
+
+def render_animacion_verificando(logo_url):
+    """Animación corta (visual 100% CSS + sonido aparte, seguro) que se
+    muestra justo
+    después de un login exitoso, antes de pasar a la pantalla de
+    consentimiento o de marcar — un anillo con degradado cyan-violeta
+    que se dibuja solo alrededor del logo de la empresa.
+
+    POR QUÉ ES SOLO CSS (decisión tomada después de varios bugs serios):
+    se intentó una versión con sonido y JavaScript real (via un iframe
+    que inyectaba contenido en la página), pero resultó poco confiable
+    entre navegadores — llegó a dejar la pantalla completamente negra
+    de forma permanente. Esta versión usa render_html() normal (el
+    mismo mecanismo que ya usan el fondo animado y los meteoritos, que
+    nunca han fallado) — vive dentro del árbol que Streamlit controla,
+    así que desaparece sola en el siguiente rerun, sin necesitar ningún
+    JavaScript de limpieza que se pueda romper."""
+    html = f"""
+    <div style="position:fixed; inset:0; z-index:9998;
+        background:rgba(10,14,26,0.95); display:flex;
+        flex-direction:column; align-items:center; justify-content:center;
+        animation:fac-desvanecer-verif 0.4s ease 1.6s forwards;">
+        <div style="position:relative; width:170px; height:170px;">
+            <div style="position:absolute; inset:0; border-radius:50%;
+                background:radial-gradient(circle, rgba(88,166,255,0.25), transparent 70%);
+                animation:fac-pulso-verif 1.4s ease-out infinite;"></div>
+            <svg width="170" height="170" viewBox="0 0 170 170"
+                style="position:absolute; top:0; left:0;">
+                <circle cx="85" cy="85" r="66" fill="none"
+                    stroke="rgba(255,255,255,0.12)" stroke-width="6"/>
+                <circle cx="85" cy="85" r="66" fill="none"
+                    stroke="url(#fac-grad-verif)" stroke-width="6"
+                    stroke-linecap="round" stroke-dasharray="415"
+                    stroke-dashoffset="415" transform="rotate(-90 85 85)"
+                    style="animation:fac-anillo-verif 1s ease forwards;"/>
+                <defs>
+                    <linearGradient id="fac-grad-verif" x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0%" stop-color="#58a6ff"/>
+                        <stop offset="100%" stop-color="#a371f7"/>
+                    </linearGradient>
+                </defs>
+            </svg>
+            <img src="{logo_url}" style="position:absolute; top:31px; left:31px;
+                width:108px; height:108px; object-fit:contain;
+                opacity:0; filter:drop-shadow(0 0 14px rgba(88,166,255,0.6));
+                animation:fac-logo-in-verif 0.4s ease 0.85s forwards;"/>
+        </div>
+        <div style="color:#8b949e; font-size:14px; margin-top:18px;
+            font-family:'Space Grotesk',sans-serif; letter-spacing:0.5px;">
+            Verificando identidad...
+        </div>
+    </div>
+    <style>
+    @keyframes fac-anillo-verif {{ to {{ stroke-dashoffset: 0; }} }}
+    @keyframes fac-logo-in-verif {{ to {{ opacity:1; }} }}
+    @keyframes fac-pulso-verif {{
+        0% {{ transform:scale(0.85); opacity:0.8; }}
+        100% {{ transform:scale(1.35); opacity:0; }}
+    }}
+    @keyframes fac-desvanecer-verif {{ to {{ opacity:0; visibility:hidden; }} }}
+    </style>
+    """
+    render_html(html)
+    render_sonido([(660, 0.12, 850), (880, 0.18, 950)])
+
+
+def render_animacion_marcado_exitoso(logo_url, hora_texto, estado="Puntual", racha=0):
+    """Sello grande y dramático (visual 100% CSS + sonido aparte,
+    seguro) —
+    cae con rebote elástico y se desvanece solo.
+
+    POR QUÉ YA NO TIENE SONIDO NI CONFETTI POR JAVASCRIPT (decisión
+    tomada después de varios bugs serios, incluyendo una pantalla que
+    se quedaba completamente negra de forma PERMANENTE): el mecanismo
+    que ejecutaba JavaScript real vía un iframe resultó poco confiable
+    entre navegadores. Esta versión usa render_html() normal (el mismo
+    mecanismo que el fondo animado y los meteoritos, que nunca han
+    fallado) — vive dentro del árbol que Streamlit controla, así que
+    desaparece sola en el siguiente rerun. Trae su propio sonido de
+    "golpe de sello" (render_sonido_sello) — sin confetti ni globos,
+    para que el sello sea el único protagonista de la celebración.
+
+    CONECTADO A LA LÓGICA REAL de la app (esto se mantiene igual):
+    - Si 'estado' es 'Tardanza', el sello sale en ámbar/naranja, con el
+      texto "TARDANZA" — no tiene sentido celebrar con la misma fiesta
+      un registro tarde que uno puntual.
+    - Si 'estado' es 'Puntual', sale en cyan/violeta.
+    - Si 'racha' (días puntuales seguidos, calculado desde la
+      asistencia real) es 2 o más, se agrega una insignia 🔥 con el
+      número — funciona como refuerzo positivo real, no inventado."""
+    es_tardanza = str(estado).strip().upper() == "TARDANZA"
+    color_principal = "#ffab40" if es_tardanza else "#58a6ff"
+    color_secundario = "#ff7043" if es_tardanza else "#a371f7"
+    texto_sello = "TARDANZA" if es_tardanza else "MARCADO ✔"
+    glow_sombra = (
+        "0 0 60px rgba(255,171,64,0.65), 0 0 120px rgba(255,112,67,0.35),"
+        " inset 0 0 30px rgba(255,171,64,0.25)"
+        if es_tardanza
+        else "0 0 60px rgba(88,166,255,0.7), 0 0 120px rgba(163,113,247,0.4),"
+        " inset 0 0 30px rgba(88,166,255,0.25)"
+    )
+    fondo_sello = (
+        "radial-gradient(circle, rgba(255,171,64,0.22), rgba(255,112,67,0.12))"
+        if es_tardanza
+        else "radial-gradient(circle, rgba(88,166,255,0.22), rgba(163,113,247,0.12))"
+    )
+    mostrar_racha = (not es_tardanza) and racha >= 2
+    badge_racha_html = (
+        f"""
+        <div style="position:absolute; top:-18px; right:-18px;
+            background:linear-gradient(135deg, #ff7043, #ffab40);
+            border-radius:24px; padding:7px 16px; font-size:16px;
+            font-weight:800; color:#1a1206; box-shadow:0 0 20px rgba(255,171,64,0.7);
+            font-family:'Space Grotesk',sans-serif;
+            animation:fac-racha-in 0.3s ease 0.55s backwards;">
+            🔥 {racha}
+        </div>
+        """
+        if mostrar_racha
+        else ""
+    )
+    html = f"""
+    <div style="position:fixed; inset:0; z-index:9998;
+        display:flex; align-items:center; justify-content:center;
+        background:rgba(10,14,26,0.6); pointer-events:none;
+        animation:fac-desvanecer-sello 0.4s ease 2.2s forwards;">
+        <div style="position:relative;">
+            {badge_racha_html}
+            <div style="width:320px; height:320px; border-radius:50%;
+                border:12px double {color_principal}; background:{fondo_sello};
+                display:flex; flex-direction:column; align-items:center;
+                justify-content:center; box-shadow:{glow_sombra};
+                animation:fac-sello-caida 0.3s cubic-bezier(.2,1.8,.4,1) forwards;">
+                <img src="{logo_url}" style="width:76px; height:76px; object-fit:contain;
+                    margin-bottom:10px; filter:drop-shadow(0 0 10px rgba(0,0,0,0.4));"/>
+                <div style="font-size:32px; font-weight:800; color:{color_principal};
+                    letter-spacing:2px; font-family:'Space Grotesk',sans-serif;
+                    text-shadow:0 0 18px {color_principal};">
+                    {texto_sello}
+                </div>
+                <div style="font-size:15px; color:{color_secundario}; margin-top:4px;
+                    font-family:'Space Grotesk',sans-serif; font-weight:600;">
+                    {hora_texto}
+                </div>
+            </div>
+        </div>
+    </div>
+    <style>
+    @keyframes fac-sello-caida {{
+        from {{ transform:scale(3.2) rotate(-25deg); opacity:0; }}
+        to {{ transform:scale(1) rotate(-8deg); opacity:1; }}
+    }}
+    @keyframes fac-racha-in {{
+        from {{ transform:scale(0); }}
+        to {{ transform:scale(1); }}
+    }}
+    @keyframes fac-desvanecer-sello {{ to {{ opacity:0; visibility:hidden; }} }}
+    </style>
+    """
+    render_html(html)
+    render_sonido_sello(delay_ms=200, grave=not es_tardanza)
+
+
+def calcular_racha_puntualidad(df_asistencia, nombre_empleado):
+    """Cuenta cuántos días PUNTUALES seguidos lleva el trabajador en sus
+    marcaciones de Entrada, contando hacia atrás desde la más reciente
+    hasta la primera Tardanza (o hasta que se acaben los datos). Se usa
+    para la insignia 🔥 del sello — es un dato real, no inventado."""
+    if df_asistencia is None or df_asistencia.empty:
+        return 0
+    entradas = df_asistencia[
+        (df_asistencia["Empleado"] == nombre_empleado)
+        & (df_asistencia["Tipo Marcación"] == "Entrada")
+    ].sort_values("Fecha", ascending=False)
+    racha = 0
+    for _, fila in entradas.iterrows():
+        if str(fila.get("Estado", "")).strip() == "Puntual":
+            racha += 1
+        else:
+            break
+    return racha
 
 
 def render_gate_consentimiento(supabase, datos_emp):
@@ -490,56 +771,14 @@ ES_CELULAR = MODO_MOVIL or (
     and st.session_state.ancho_pantalla_px < 768
 )
 
-# Enter para confirmar (solo en PC, no en celular): al presionar Enter
-# dentro de un campo de texto/contraseña, se hace clic automáticamente
-# en el botón de confirmación más cercano (PIN, contraseña de
-# marcación, cualquier formulario nuevo que se agregue a futuro) — así
-# no hace falta usar el mouse para confirmar. En celular se deja igual
-# que siempre (no se inyecta nada).
-if not ES_CELULAR:
-    render_html(
-        """
-        <script>
-        (function() {
-            if (window._facEnterListo) { return; }
-            window._facEnterListo = true;
-            // FASE DE CAPTURA (el 'true' final): Streamlit tiene su
-            // propio manejador de Enter en cada campo, que dispara su
-            // propio "recargar la página" antes de que nuestro clic
-            // llegue a ejecutarse — eso hacía que "cargara pero no
-            // abriera nada" y hubiera que hacerlo manual. Escuchando en
-            // fase de captura interceptamos el Enter ANTES que
-            // Streamlit, evitamos su recarga con stopPropagation, y
-            // hacemos nosotros mismos el clic en el botón.
-            document.addEventListener('keydown', function(e) {
-                if (e.key !== 'Enter') { return; }
-                const activo = document.activeElement;
-                if (!activo || activo.tagName !== 'INPUT') { return; }
-                if (activo.type !== 'password') { return; }
-                let el = activo.closest('[data-testid="stVerticalBlock"]');
-                let intentos = 0;
-                while (el && intentos < 8) {
-                    const botones = el.querySelectorAll('button');
-                    for (const b of botones) {
-                        if (!b.disabled && b.offsetParent !== null) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            e.stopImmediatePropagation();
-                            b.click();
-                            return;
-                        }
-                    }
-                    const padre = el.parentElement;
-                    el = padre
-                        ? padre.closest('[data-testid="stVerticalBlock"]')
-                        : null;
-                    intentos++;
-                }
-            }, true);
-        })();
-        </script>
-        """
-    )
+# Enter para confirmar (DESACTIVADO por seguridad): usaba el mismo
+# mecanismo de inyección de script que causó los bugs serios del sello
+# (incluida una pantalla que se quedaba negra permanentemente). Aunque
+# esto en particular no se había reportado roto, usa exactamente el
+# mismo mecanismo riesgoso, así que se prefiere quitarlo antes de que
+# cause un problema silencioso — mejor volver al comportamiento nativo
+# de Streamlit (clic en el botón) hasta encontrar una forma más segura
+# de hacerlo.
 
 # VISTA_TRABAJADOR_MOVIL: además de ser celular, la persona todavía no
 # inició sesión como Admin/SuperAdmin/Developer con PIN. Es la vista
@@ -1170,7 +1409,14 @@ def eliminar_empresa_supabase(supabase, empresa_id):
     ).execute()
 
 
+@st.cache_data(ttl=5)
 def cargar_empresas():
+    # OPTIMIZACIÓN: cacheado 5 segundos. La lista de empresas casi no
+    # cambia de un momento a otro, así que evita pedirle esto a
+    # Supabase en cada actualización de pantalla (foto, GPS, auto-
+    # refresco) — 5 segundos es corto a propósito, para que si el
+    # developer acaba de crear una empresa nueva, la vea reflejada casi
+    # de inmediato en vez de tener que esperar mucho.
     registros_empresas = cargar_empresas_supabase(supabase)
     columnas_empresas = [
         "empresa_id",
@@ -1420,16 +1666,25 @@ def enviar_backup_email(asunto, cuerpo, adjuntos):
         server.send_message(msg)
 
 
-def cargar_configuracion_sistema(supabase, empresa_id):
+@st.cache_data(ttl=30)
+def cargar_configuracion_sistema(_supabase, empresa_id):
     """Carga PINs, clave de Excel y contraseña por defecto desde Supabase
     para esta empresa (tabla configuracion_sistema). Si no hay fila
     guardada todavía, deja los valores que ya estaban en session_state
-    (los de Secrets o los de respaldo)."""
-    if not supabase:
+    (los de Secrets o los de respaldo).
+
+    OPTIMIZACIÓN: cacheado 30 segundos — esto casi no cambia de un
+    momento a otro (PINs, régimen laboral, logo), así que no hace falta
+    volver a pedirlo a Supabase en cada actualización de pantalla. El
+    parámetro se llama '_supabase' (con guion bajo) a propósito: así le
+    decimos a Streamlit que NO intente cachear basándose en ese objeto
+    (los clientes de Supabase no se pueden "hashear" de forma
+    confiable) — solo cachea según el empresa_id."""
+    if not _supabase:
         return
     try:
         res = (
-            supabase.table("configuracion_sistema")
+            _supabase.table("configuracion_sistema")
             .select("*")
             .eq("empresa_id", str(empresa_id))
             .limit(1)
@@ -1449,6 +1704,8 @@ def cargar_configuracion_sistema(supabase, empresa_id):
             st.session_state.regimen_laboral = (
                 cfg.get("regimen_laboral") or "GENERAL"
             )
+            if cfg.get("logo_globos_url"):
+                st.session_state.logo_globos_url = cfg["logo_globos_url"]
     except Exception:
         pass  # si falla, se sigue usando lo que ya había cargado
 
@@ -3038,7 +3295,15 @@ def procesar_carga_masiva_sedes(supabase, archivo_excel):
     return resultado
 
 
+@st.cache_data(ttl=5)
 def cargar_datos(empresa_id):
+    # OPTIMIZACIÓN: cacheado 5 segundos. Esta función trae sedes,
+    # empleados Y sincroniza las marcaciones nuevas desde la Nube — es
+    # la que más pesa de toda la app, y sin caché se repetía en cada
+    # actualización de pantalla (foto, GPS, auto-refresco), lo cual
+    # hacía sentir lenta la pantalla de Marcar Asistencia. 5 segundos
+    # es corto a propósito para no perder la sensación de "casi en
+    # tiempo real" que ya tenía el sistema.
     cargar_empresas()
 
     registros_sedes = cargar_sedes_supabase(supabase, empresa_id)
@@ -3449,20 +3714,36 @@ if not VISTA_TRABAJADOR_MOVIL:
                 st.session_state.empresa_id = empresas_filtradas.iloc[0]["empresa_id"]
             st.rerun()
 
-        # Personalización de la animación de "globos" al marcar asistencia
-        # (solo visible para el Developer con el entorno DEV desbloqueado).
-        with st.sidebar.expander("🎈 Animación de éxito (solo dev)"):
-            st.session_state.logo_globos_url = st.text_input(
-                "URL de imagen para los globos:",
+        # Personalización del logo para las animaciones (sello,
+        # verificación, meteoritos). Se guarda en Supabase para que
+        # aplique a TODOS los dispositivos y sesiones, no solo a la que
+        # lo configura (antes solo vivía en esta sesión del navegador).
+        with st.sidebar.expander("🏅 Animación de éxito (solo dev)"):
+            _logo_nuevo = st.text_input(
+                "URL del logo para el sello, verificación y meteoritos:",
                 value=st.session_state.get(
                     "logo_globos_url", "/app/static/icon-192.png"
                 ),
                 help=(
-                    "Se usa en la animación que sube en globos al"
-                    " confirmar una marcación. Por defecto es el ícono de"
-                    " la app."
+                    "Se usa en el sello que aparece al confirmar una"
+                    " marcación, en el anillo de verificación al iniciar"
+                    " sesión, y en los meteoritos de fondo. Por defecto"
+                    " es el ícono de la app. Se guarda para TODOS los"
+                    " dispositivos, no solo este."
                 ),
             )
+            if _logo_nuevo != st.session_state.get("logo_globos_url", ""):
+                st.session_state.logo_globos_url = _logo_nuevo
+                if supabase:
+                    try:
+                        guardar_configuracion_sistema(
+                            supabase,
+                            st.session_state.empresa_id,
+                            logo_globos_url=_logo_nuevo,
+                        )
+                        st.success("✅ Logo actualizado para todos.")
+                    except Exception as e:
+                        st.warning(f"No se pudo guardar en la nube ({e}).")
 
         # Indicador de estado del Nivel 1 (detección de rostro). Solo
         # visible aquí, con el entorno DEV desbloqueado, para que el
@@ -3488,6 +3769,13 @@ df_empresas = cargar_empresas()
 df_sedes, df_empleados, df_asistencia = cargar_datos(
     st.session_state.empresa_id
 )
+
+# Trae la configuración general (logo de las animaciones, horas extra,
+# régimen laboral) para TODOS los flujos — antes solo se cargaba para
+# Admin/Developer, así que un trabajador que solo entraba a marcar
+# nunca veía el logo configurado (siempre caía al ícono por defecto).
+if supabase and st.session_state.empresa_id:
+    cargar_configuracion_sistema(supabase, st.session_state.empresa_id)
 
 # Sincroniza el interruptor global de "Mejoras en Producción" con lo que
 # haya guardado en Supabase, para que sea el mismo estado en todas las
@@ -5059,6 +5347,49 @@ else:
         st.rerun()
 
 if opcion == "⏰ Marcar Asistencia":
+    _logo_meteoros = st.session_state.get(
+        "logo_globos_url", "/app/static/icon-192.png"
+    )
+    _html_meteoros = (
+        '<div style="position:fixed; inset:0; z-index:-1; overflow:hidden;'
+        ' pointer-events:none;">'
+    )
+    for _m in range(4):
+        _top_ini = random.randint(-10, 35)
+        _left_ini = random.randint(55, 125)
+        _delay_m = round(random.uniform(0, 7), 2)
+        _dur_m = round(random.uniform(5, 8), 2)
+        _tam = random.randint(60, 100)
+        _html_meteoros += f"""
+        <div style="position:absolute; top:{_top_ini}%; left:{_left_ini}%;
+            width:{_tam}px; height:{_tam}px;
+            animation:fac-meteoro {_dur_m}s linear {_delay_m}s infinite;">
+            <div style="position:absolute; right:100%; top:50%;
+                width:220px; height:5px; transform:translateY(-50%);
+                background:linear-gradient(90deg, transparent,
+                rgba(88,166,255,0.75));"></div>
+            <img src="{_logo_meteoros}" style="width:100%; height:100%;
+                object-fit:contain; opacity:0.85;
+                filter:drop-shadow(0 0 16px rgba(88,166,255,0.85))
+                drop-shadow(0 0 30px rgba(163,113,247,0.5));"/>
+        </div>
+        """
+    _html_meteoros += """
+    </div>
+    <style>
+    @keyframes fac-meteoro{
+        0%{ transform:translate(0,0) rotate(0deg); opacity:0; }
+        6%{ opacity:0.9; }
+        94%{ opacity:0.75; }
+        100%{ transform:translate(-160vw, 160vh) rotate(-25deg); opacity:0; }
+    }
+    @media (prefers-reduced-motion: reduce){
+        [style*="fac-meteoro"]{ animation:none !important; }
+    }
+    </style>
+    """
+    render_html(_html_meteoros)
+
     render_html(
         f"""
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
@@ -5213,7 +5544,11 @@ if opcion == "⏰ Marcar Asistencia":
                         if login_ok:
                             st.session_state.emp_login_ok = True
                             st.session_state.emp_datos = emp_match.iloc[0]
-                            st.success("Acceso verificado correctamente.")
+                            _logo_verif = st.session_state.get(
+                                "logo_globos_url", "/app/static/icon-192.png"
+                            )
+                            render_animacion_verificando(_logo_verif)
+                            _dormir(1.5)
                             st.rerun()
                         else:
                             st.error(
@@ -5597,52 +5932,23 @@ if opcion == "⏰ Marcar Asistencia":
                         "localmente!"
                     )
 
-                # --- Animación de "globos" con el logo (celebración) ---
+                # --- Animación de marcación exitosa: sello (100% CSS,
+                # confiable) con su propio sonido de "golpe de sello" —
+                # sin globos, para que el sello sea el único
+                # protagonista, adaptada al estado real
+                # (Puntual/Tardanza) y a la racha real de puntualidad
+                # del trabajador ---
                 _logo_globos = st.session_state.get(
                     "logo_globos_url", "/app/static/icon-192.png"
                 )
-                _html_globos = (
-                    '<div style="position:fixed; inset:0; pointer-events:none;'
-                    ' z-index:9999; overflow:hidden;">'
+                _racha_actual = 0
+                if tipo_marcacion == "Entrada" and estado == "Puntual":
+                    _racha_actual = 1 + calcular_racha_puntualidad(
+                        df_asistencia, datos_emp["nombre"]
+                    )
+                render_animacion_marcado_exitoso(
+                    _logo_globos, hora_str, estado=estado, racha=_racha_actual
                 )
-                for _i in range(10):
-                    _left = random.randint(2, 92)
-                    _delay = round(random.uniform(0, 1.4), 2)
-                    _drift = random.randint(-60, 60)
-                    _rot = random.randint(-14, 14)
-                    _dur = round(random.uniform(3.4, 5.2), 2)
-                    _html_globos += f"""
-                    <div style="position:absolute; bottom:-140px; left:{_left}%;
-                        width:52px; height:66px;
-                        animation:fac-float-up {_dur}s ease-in {_delay}s 1;
-                        --drift:{_drift}px; --rot:{_rot}deg;">
-                        <div style="width:100%; height:100%;
-                            border-radius:50% 50% 50% 50% / 58% 58% 42% 42%;
-                            background:linear-gradient(160deg, var(--cyan), var(--violet));
-                            box-shadow:0 6px 18px rgba(0,0,0,0.35);
-                            display:flex; align-items:center; justify-content:center;">
-                            <img src="{_logo_globos}" style="width:60%; height:60%;
-                                object-fit:contain; border-radius:50%;
-                                background:rgba(255,255,255,0.85);" />
-                        </div>
-                        <div style="position:absolute; left:50%; top:100%; width:1px;
-                            height:24px; background:rgba(255,255,255,0.35);
-                            transform:translateX(-50%);"></div>
-                    </div>
-                    """
-                _html_globos += """
-                </div>
-                <style>
-                @keyframes fac-float-up{
-                    0%{ transform:translateY(0) translateX(0) rotate(0deg); opacity:0; }
-                    8%{ opacity:1; }
-                    100%{ transform:translateY(-115vh) translateX(var(--drift, 30px)) rotate(var(--rot, 8deg)); opacity:0; }
-                }
-                </style>
-                """
-                # render_html() ya le quita la indentación de cada línea
-                # antes de mostrarla como HTML real (ver su docstring).
-                render_html(_html_globos)
 
 elif opcion == "🔐 Panel de Gestión / Admin":
     if not st.session_state.autenticado:
