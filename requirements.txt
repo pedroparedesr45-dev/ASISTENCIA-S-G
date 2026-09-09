@@ -8,6 +8,5 @@ plotly
 Pillow
 streamlit-js-eval
 tzdata
-opencv-python-headless
 mediapipe
 opencv-python-headless
