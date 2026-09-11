@@ -6594,15 +6594,13 @@ elif opcion == "🔐 Panel de Gestión / Admin":
         st.title("🔐 Acceso Administrativo")
         cargar_pin_developer_global(supabase)
 
-        df_e_disponibles = df_empresas
+        df_prod = df_empresas[df_empresas["entorno"] != "DEV"]
+        df_dev = df_empresas[df_empresas["entorno"] == "DEV"]
 
-        if df_e_disponibles.empty:
+        if df_empresas.empty:
             # Base de datos 100% vacía: todavía no existe ninguna
             # empresa. Se deja entrar solo con el PIN Developer para
-            # crear la primera — al no haber ninguna empresa marcada
-            # como entorno de desarrollo todavía, esta es la ÚNICA
-            # excepción donde el PIN Developer funciona sin tener una
-            # empresa de desarrollo seleccionada.
+            # crear la primera.
             st.info(
                 "No hay ninguna empresa registrada todavía en esta base"
                 " de datos. Ingresa el PIN Developer para entrar y crear"
@@ -6621,60 +6619,76 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 else:
                     st.error("PIN Incorrecto.")
         else:
-            empresa_admin = st.selectbox(
-                "Seleccione Empresa:",
-                df_e_disponibles["empresa_id"].unique(),
-            )
-            if empresa_admin:
-                cargar_configuracion_sistema(supabase, empresa_admin)
+            # Dos bloques totalmente separados, aislados entre sí — el
+            # de Producción NUNCA muestra la empresa de Desarrollo, y
+            # el de Desarrollo NUNCA muestra empresas de Producción.
+            # No es un paso previo de "cómo quieres entrar" — los dos
+            # están a la vista al mismo tiempo, cada quien usa el que
+            # le corresponde.
+            col_prod, col_dev = st.columns(2)
 
-            # Automático: la empresa elegida ¿es la de Desarrollo? Esto
-            # es lo que decide, SIN ningún selector aparte, si el PIN
-            # Developer va a funcionar aquí o no.
-            es_empresa_dev = False
-            if empresa_admin:
-                _fila_emp_sel = df_e_disponibles[
-                    df_e_disponibles["empresa_id"] == empresa_admin
-                ]
-                if not _fila_emp_sel.empty:
-                    es_empresa_dev = (
-                        str(_fila_emp_sel.iloc[0].get("entorno", "PROD"))
-                        == "DEV"
-                    )
-
-            pin = st.text_input("Ingrese PIN de Acceso:", type="password")
-
-            if st.button("Ingresar al Panel"):
-                if empresa_admin:
-                    st.session_state.empresa_id = empresa_admin
-                    st.session_state.developer_global = False
-                    if clave_coincide(pin, st.session_state.pin_admin):
-                        st.session_state.autenticado = True
-                        st.session_state.rol = "admin"
-                        st.rerun()
-                    elif clave_coincide(pin, st.session_state.pin_visor):
-                        st.session_state.autenticado = True
-                        st.session_state.rol = "visor"
-                        st.rerun()
-                    elif clave_coincide(pin, st.session_state.pin_master):
-                        st.session_state.autenticado = True
-                        st.session_state.rol = "master"
-                        st.rerun()
-                    elif es_empresa_dev and clave_coincide(
-                        pin, st.session_state.pin_developer
-                    ):
-                        # El PIN Developer SOLO funciona si la empresa
-                        # elegida es la marcada como Desarrollo — en
-                        # cualquier empresa de Producción, este mismo
-                        # PIN cae aquí y se rechaza como incorrecto.
-                        st.session_state.autenticado = True
-                        st.session_state.rol = "master"
-                        st.session_state.developer_global = True
-                        st.rerun()
-                    else:
-                        st.error("PIN Incorrecto.")
+            with col_prod:
+                st.markdown("##### 🏭 Producción")
+                if df_prod.empty:
+                    st.caption("No hay empresas de Producción todavía.")
                 else:
-                    st.error("No hay empresas disponibles.")
+                    empresa_prod = st.selectbox(
+                        "Empresa:",
+                        df_prod["empresa_id"].unique(),
+                        key="empresa_prod_sel",
+                    )
+                    if empresa_prod:
+                        cargar_configuracion_sistema(supabase, empresa_prod)
+                    pin_prod = st.text_input(
+                        "PIN de Acceso:", type="password", key="pin_prod_sel"
+                    )
+                    if st.button("Ingresar", key="btn_ingresar_prod"):
+                        st.session_state.empresa_id = empresa_prod
+                        st.session_state.developer_global = False
+                        if clave_coincide(pin_prod, st.session_state.pin_admin):
+                            st.session_state.autenticado = True
+                            st.session_state.rol = "admin"
+                            st.rerun()
+                        elif clave_coincide(pin_prod, st.session_state.pin_visor):
+                            st.session_state.autenticado = True
+                            st.session_state.rol = "visor"
+                            st.rerun()
+                        elif clave_coincide(pin_prod, st.session_state.pin_master):
+                            st.session_state.autenticado = True
+                            st.session_state.rol = "master"
+                            st.rerun()
+                        else:
+                            # El PIN Developer NUNCA se revisa aquí — en
+                            # Producción no existe esa puerta.
+                            st.error("PIN Incorrecto.")
+
+            with col_dev:
+                st.markdown("##### 🧪 Desarrollo")
+                if df_dev.empty:
+                    st.caption(
+                        "No hay ninguna empresa marcada como Desarrollo"
+                        " todavía."
+                    )
+                else:
+                    empresa_dev = st.selectbox(
+                        "Empresa:",
+                        df_dev["empresa_id"].unique(),
+                        key="empresa_dev_sel",
+                    )
+                    if empresa_dev:
+                        cargar_configuracion_sistema(supabase, empresa_dev)
+                    pin_dev = st.text_input(
+                        "PIN Developer:", type="password", key="pin_dev_sel"
+                    )
+                    if st.button("Ingresar", key="btn_ingresar_dev"):
+                        if clave_coincide(pin_dev, st.session_state.pin_developer):
+                            st.session_state.empresa_id = empresa_dev
+                            st.session_state.autenticado = True
+                            st.session_state.rol = "master"
+                            st.session_state.developer_global = True
+                            st.rerun()
+                        else:
+                            st.error("PIN Incorrecto.")
     else:
         from streamlit_autorefresh import st_autorefresh
 
