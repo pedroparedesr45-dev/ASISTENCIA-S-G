@@ -631,7 +631,7 @@ def render_animacion_marcado_exitoso(logo_url, hora_texto, estado="Puntual", rac
 
 
 def render_tarjetas_asistencia_hoy(
-    df_lista_empleados, mapa_estado, mapa_hora, cols_por_fila=4,
+    df_lista_empleados, mapa_estado, mapa_hora, cols_por_fila=3,
     mapa_salida_estado=None, mapa_salida_hora=None, mapa_horas_extra=None,
 ):
     """Dibuja la cuadrícula de tarjetas de '¿Quién marcó hoy?' — una
@@ -640,7 +640,8 @@ def render_tarjetas_asistencia_hoy(
     renglón con eso: 'Salida Puntual' (verde, salió a su hora oficial
     o después) o 'Salida Temprano' (ámbar, se fue antes) — más la Hora
     Extra si la empresa la reconoce (interruptor en Ajustes) y sí
-    trabajó de más ese día."""
+    trabajó de más ese día. Tarjetas más grandes a pedido (3 por fila
+    en vez de 4, tipografía más grande)."""
     mapa_salida_estado = mapa_salida_estado or {}
     mapa_salida_hora = mapa_salida_hora or {}
     mapa_horas_extra = mapa_horas_extra or {}
@@ -680,32 +681,32 @@ def render_tarjetas_asistencia_hoy(
                     )
 
                 salida_html = f"""
-                <div style="font-size:11px; color:{color_sal};
-                    font-weight:700; margin-top:4px;">
+                <div style="font-size:15px; color:{color_sal};
+                    font-weight:700; margin-top:8px;">
                     🚪 {texto_sal}{extra_html}
                 </div>
-                <div style="font-size:10px; color:#8b949e;">
+                <div style="font-size:13px; color:#8b949e; margin-top:2px;">
                     {hora_salida}
                 </div>
                 """
 
             with fila_cols[j]:
                 render_html(f"""
-                <div style="border:2px solid {color};
-                    border-radius:12px; padding:10px 12px;
-                    margin-bottom:8px;
-                    background:rgba(255,255,255,0.03);">
-                    <div style="font-size:13px; font-weight:600;
+                <div style="border:3px solid {color};
+                    border-radius:16px; padding:18px 20px;
+                    margin-bottom:14px;
+                    background:rgba(255,255,255,0.04);">
+                    <div style="font-size:18px; font-weight:700;
                         color:#e6edf3; white-space:nowrap;
                         overflow:hidden; text-overflow:ellipsis;">
                         {nombre_emp}
                     </div>
-                    <div style="font-size:12px; color:{color};
-                        font-weight:700; margin-top:4px;">
+                    <div style="font-size:16px; color:{color};
+                        font-weight:800; margin-top:8px;">
                         {icono} {texto}
                     </div>
-                    <div style="font-size:11px; color:#8b949e;
-                        margin-top:2px;">
+                    <div style="font-size:14px; color:#8b949e;
+                        margin-top:4px;">
                         {hora if hora else "&nbsp;"}
                     </div>
                     {salida_html}
@@ -775,12 +776,25 @@ def calcular_planilla_todos_los_empleados(
             ]
             if not emp_asist.empty else pd.DataFrame()
         )
+        _entrada_mes_solo = (
+            emp_asist_mes[emp_asist_mes["Tipo Marcación"] == "Entrada"]
+            if not emp_asist_mes.empty else emp_asist_mes
+        )
+        # CORREGIDO: bug real que afectaba la Planilla — antes se
+        # contaba "Puntual"/"Tardanza" sobre TODAS las marcaciones del
+        # mes (Entrada Y Salida mezcladas). Como la Salida también
+        # puede decir "Puntual", un mismo día con Entrada Tardanza +
+        # Salida Puntual se contaba DOBLE (una vez como tardanza, otra
+        # como puntual), inflando los "días laborados" usados para
+        # calcular el sueldo. Ahora solo se cuenta la marcación de
+        # Entrada, que es la que de verdad determina si llegó puntual
+        # o tarde ese día.
         tardanzas_dias = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Tardanza"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Tardanza"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         puntuales = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Puntual"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Puntual"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         min_tardanza = int(emp_asist_mes["Minutos Tardanza"].sum()) if not emp_asist_mes.empty else 0
@@ -2097,6 +2111,13 @@ def cargar_configuracion_sistema(_supabase, empresa_id):
             st.session_state.planilla_habilitada = bool(
                 cfg.get("planilla_habilitada", False)
             )
+            if cfg.get("dias_laborables"):
+                try:
+                    st.session_state.dias_laborables = json.loads(
+                        cfg["dias_laborables"]
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass  # si falla, se sigue usando lo que ya había cargado
 
@@ -3134,12 +3155,25 @@ def generar_excel_afpnet(df_empleados, df_asistencia, mes_sel, anio_sel, supabas
             emp_asist[emp_asist["Fecha"].astype(str).str.startswith(prefix_periodo)]
             if not emp_asist.empty else pd.DataFrame()
         )
+        _entrada_mes_solo = (
+            emp_asist_mes[emp_asist_mes["Tipo Marcación"] == "Entrada"]
+            if not emp_asist_mes.empty else emp_asist_mes
+        )
+        # CORREGIDO: bug real que afectaba la Planilla — antes se
+        # contaba "Puntual"/"Tardanza" sobre TODAS las marcaciones del
+        # mes (Entrada Y Salida mezcladas). Como la Salida también
+        # puede decir "Puntual", un mismo día con Entrada Tardanza +
+        # Salida Puntual se contaba DOBLE (una vez como tardanza, otra
+        # como puntual), inflando los "días laborados" usados para
+        # calcular el sueldo. Ahora solo se cuenta la marcación de
+        # Entrada, que es la que de verdad determina si llegó puntual
+        # o tarde ese día.
         tardanzas_dias = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Tardanza"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Tardanza"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         puntuales = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Puntual"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Puntual"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         min_tardanza = int(emp_asist_mes["Minutos Tardanza"].sum()) if not emp_asist_mes.empty else 0
@@ -3230,12 +3264,25 @@ def generar_borrador_plame(df_empleados, df_asistencia, mes_sel, anio_sel, supab
             emp_asist[emp_asist["Fecha"].astype(str).str.startswith(prefix_periodo)]
             if not emp_asist.empty else pd.DataFrame()
         )
+        _entrada_mes_solo = (
+            emp_asist_mes[emp_asist_mes["Tipo Marcación"] == "Entrada"]
+            if not emp_asist_mes.empty else emp_asist_mes
+        )
+        # CORREGIDO: bug real que afectaba la Planilla — antes se
+        # contaba "Puntual"/"Tardanza" sobre TODAS las marcaciones del
+        # mes (Entrada Y Salida mezcladas). Como la Salida también
+        # puede decir "Puntual", un mismo día con Entrada Tardanza +
+        # Salida Puntual se contaba DOBLE (una vez como tardanza, otra
+        # como puntual), inflando los "días laborados" usados para
+        # calcular el sueldo. Ahora solo se cuenta la marcación de
+        # Entrada, que es la que de verdad determina si llegó puntual
+        # o tarde ese día.
         tardanzas_dias = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Tardanza"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Tardanza"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         puntuales = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Puntual"]["Fecha"].nunique()
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Puntual"]["Fecha"].nunique()
             if not emp_asist_mes.empty else 0
         )
         min_tardanza = int(emp_asist_mes["Minutos Tardanza"].sum()) if not emp_asist_mes.empty else 0
@@ -5003,15 +5050,22 @@ def _construir_hoja_planilla(
             if not emp_asist.empty
             else pd.DataFrame()
         )
+        _entrada_mes_solo = (
+            emp_asist_mes[emp_asist_mes["Tipo Marcación"] == "Entrada"]
+            if not emp_asist_mes.empty else emp_asist_mes
+        )
+        # Ver nota completa en calcular_planilla_todos_los_empleados:
+        # solo se cuenta la marcación de Entrada para Puntual/Tardanza,
+        # nunca la Salida (que también puede decir "Puntual").
         tardanzas_dias = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Tardanza"][
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Tardanza"][
                 "Fecha"
             ].nunique()
             if not emp_asist_mes.empty
             else 0
         )
         puntuales = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Puntual"][
+            _entrada_mes_solo[_entrada_mes_solo["Estado"] == "Puntual"][
                 "Fecha"
             ].nunique()
             if not emp_asist_mes.empty
@@ -5377,15 +5431,22 @@ def generar_excel_completo(df_asistencia, df_empleados, mes_sel, anio_sel):
             else pd.DataFrame()
         )
 
+        _entrada_mes_solo2 = (
+            emp_asist_mes[emp_asist_mes["Tipo Marcación"] == "Entrada"]
+            if not emp_asist_mes.empty else emp_asist_mes
+        )
+        # Ver nota completa en calcular_planilla_todos_los_empleados:
+        # solo se cuenta la marcación de Entrada para Puntual/Tardanza,
+        # nunca la Salida (que también puede decir "Puntual").
         tardanzas = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Tardanza"][
+            _entrada_mes_solo2[_entrada_mes_solo2["Estado"] == "Tardanza"][
                 "Fecha"
             ].nunique()
             if not emp_asist_mes.empty
             else 0
         )
         puntuales = (
-            emp_asist_mes[emp_asist_mes["Estado"] == "Puntual"][
+            _entrada_mes_solo2[_entrada_mes_solo2["Estado"] == "Puntual"][
                 "Fecha"
             ].nunique()
             if not emp_asist_mes.empty
@@ -6585,7 +6646,19 @@ if opcion == "⏰ Marcar Asistencia":
                     h_salida_ofic = datetime.strptime(
                         hora_salida_oficial, "%H:%M:%S"
                     ).time()
-                    if now.time() > h_salida_ofic:
+                    # CORREGIDO: antes 'estado' se quedaba SIEMPRE en
+                    # "Puntual" para la Salida (nunca se tocaba), sin
+                    # importar la hora real de salida — por eso la
+                    # bitácora mostraba "Puntual" sin que significara
+                    # nada de verdad. Ahora sí refleja si salió a su
+                    # hora oficial o después (Puntual) o antes
+                    # (Temprano) — igual que ya calcula el calendario y
+                    # las tarjetas del Dashboard, para que todo el
+                    # sistema diga lo mismo.
+                    if now.time() < h_salida_ofic:
+                        estado = "Temprano"
+                    else:
+                        estado = "Puntual"
                         t1 = datetime.combine(datetime.today(), now.time())
                         t2 = datetime.combine(datetime.today(), h_salida_ofic)
                         minutos_extra = int((t1 - t2).total_seconds() / 60)
@@ -6709,7 +6782,55 @@ if opcion == "⏰ Marcar Asistencia":
 
 elif opcion == "🔐 Panel de Gestión / Admin":
     if not st.session_state.autenticado:
-        st.title("🔐 Acceso Administrativo")
+        # Mismo lenguaje visual que la pantalla de Marcar Asistencia
+        # (anillo cyan-violeta con pulso) — para que el Panel de
+        # Gestión se sienta parte del mismo sistema, no una pantalla
+        # aparte. Es una versión FIJA (no de una sola vez), 100% CSS.
+        render_html("""
+        <div style="display:flex; justify-content:center; margin-bottom:8px;">
+            <div style="position:relative; width:86px; height:86px;">
+                <div style="position:absolute; inset:0; border-radius:50%;
+                    background:radial-gradient(circle, rgba(88,166,255,0.22), transparent 70%);
+                    animation:fac-pulso-admin 2.2s ease-out infinite;"></div>
+                <svg width="86" height="86" viewBox="0 0 86 86"
+                    style="position:absolute; top:0; left:0;">
+                    <circle cx="43" cy="43" r="34" fill="none"
+                        stroke="rgba(255,255,255,0.10)" stroke-width="4"/>
+                    <circle cx="43" cy="43" r="34" fill="none"
+                        stroke="url(#fac-grad-admin)" stroke-width="4"
+                        stroke-linecap="round" stroke-dasharray="70 144"
+                        style="animation:fac-girar-admin 3.5s linear infinite;
+                            transform-origin:43px 43px;"/>
+                    <defs>
+                        <linearGradient id="fac-grad-admin" x1="0" y1="0" x2="1" y2="1">
+                            <stop offset="0%" stop-color="#58a6ff"/>
+                            <stop offset="100%" stop-color="#a371f7"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <div style="position:absolute; inset:0; display:flex;
+                    align-items:center; justify-content:center;
+                    font-size:32px;
+                    filter:drop-shadow(0 0 10px rgba(88,166,255,0.55));">
+                    🔐
+                </div>
+            </div>
+        </div>
+        <style>
+        @keyframes fac-pulso-admin {
+            0% { transform:scale(0.85); opacity:0.8; }
+            100% { transform:scale(1.4); opacity:0; }
+        }
+        @keyframes fac-girar-admin {
+            from { transform:rotate(0deg); }
+            to { transform:rotate(360deg); }
+        }
+        </style>
+        """)
+        st.markdown(
+            "<h2 style='text-align:center;'>Acceso Administrativo</h2>",
+            unsafe_allow_html=True,
+        )
         cargar_pin_developer_global(supabase)
 
         df_prod = df_empresas[df_empresas["entorno"] != "DEV"]
@@ -6995,29 +7116,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             )
             prefix_filtro = f"{anio_sel}-{mes_sel:02d}"
             num_dias_mes_gen = calendar.monthrange(anio_sel, mes_sel)[1]
-
-            # --- NUEVO (solo visual): tarjeta de resumen global, todas las
-            # sedes juntas, antes del detalle por local. No reemplaza ni
-            # modifica ninguno de los cálculos existentes por sede. ---
-            df_mes_general = df_asistencia[
-                df_asistencia["Fecha"].astype(str).str.startswith(prefix_filtro)
-            ]
-            with st.container(border=True):
-                st.markdown("##### 🌐 Resumen General — Todas las Sedes")
-                gg1, gg2, gg3, gg4 = st.columns(4)
-                gg1.metric("Personal Total", f"{len(df_empleados)} emps")
-                gg2.metric(
-                    "Puntualidades del Mes",
-                    f"{df_mes_general[df_mes_general['Estado'] == 'Puntual']['Fecha'].nunique() if not df_mes_general.empty else 0} días",
-                )
-                gg3.metric(
-                    "Tardanzas del Mes",
-                    f"{df_mes_general[df_mes_general['Estado'] == 'Tardanza']['Fecha'].nunique() if not df_mes_general.empty else 0} días",
-                )
-                gg4.metric(
-                    "Minutos Extras del Mes",
-                    f"{int(df_mes_general['Horas Extra (min)'].sum()) if not df_mes_general.empty else 0} min",
-                )
 
             st.divider()
 
@@ -7405,23 +7503,90 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         fechas_disponibles,
                                     )
 
+                                    # Entrada y Salida son registros
+                                    # DISTINTOS del mismo día — se
+                                    # editan por separado, cada una con
+                                    # sus propios valores (antes se
+                                    # aplicaba lo mismo a ambas de
+                                    # golpe, lo cual era un error si
+                                    # tenían Estado/minutos distintos).
+                                    df_dia_edit = df_editables[
+                                        df_editables["Fecha"] == f_edit_sel
+                                    ]
+                                    tipos_disponibles_dia = list(
+                                        df_dia_edit["Tipo Marcación"].unique()
+                                    )
+                                    tipo_a_editar = st.radio(
+                                        "¿Cuál marcación de ese día?",
+                                        tipos_disponibles_dia,
+                                        horizontal=True,
+                                    )
+                                    fila_actual_edit = df_dia_edit[
+                                        df_dia_edit["Tipo Marcación"]
+                                        == tipo_a_editar
+                                    ].iloc[0]
+
+                                    if st.session_state.developer_global:
+                                        st.caption(
+                                            "🧪 Developer: también puedes"
+                                            " corregir la HORA exacta en"
+                                            " que se marcó — Admin y"
+                                            " SuperAdmin no ven este campo."
+                                        )
+                                        _hora_actual_edit = fila_actual_edit.get(
+                                            "Hora Registrada", "08:00:00"
+                                        )
+                                        try:
+                                            _hora_actual_t = datetime.strptime(
+                                                str(_hora_actual_edit), "%H:%M:%S"
+                                            ).time()
+                                        except Exception:
+                                            _hora_actual_t = time(8, 0, 0)
+                                        nueva_hora_registrada = st.time_input(
+                                            "Hora exacta de la marcación:",
+                                            value=_hora_actual_t,
+                                        )
+                                    else:
+                                        nueva_hora_registrada = None
+
                                     col_e_m1, col_e_m2, col_e_m3 = st.columns(3)
                                     with col_e_m1:
+                                        _idx_estado_actual = (
+                                            ["Puntual", "Tardanza", "Falta", "Temprano"]
+                                            .index(fila_actual_edit.get("Estado", "Puntual"))
+                                            if fila_actual_edit.get("Estado") in
+                                            ["Puntual", "Tardanza", "Falta", "Temprano"]
+                                            else 0
+                                        )
                                         nuevo_est = st.selectbox(
                                             "Estado:",
-                                            ["Puntual", "Tardanza", "Falta"],
+                                            ["Puntual", "Tardanza", "Falta", "Temprano"],
+                                            index=_idx_estado_actual,
+                                            help=(
+                                                "'Temprano' aplica solo a"
+                                                " Salida (se fue antes de"
+                                                " su hora oficial)."
+                                            ),
                                         )
                                     with col_e_m2:
                                         nuevos_min_t = st.number_input(
                                             "Min. Tardanza:",
                                             min_value=0,
-                                            value=0,
+                                            value=int(
+                                                fila_actual_edit.get(
+                                                    "Minutos Tardanza", 0
+                                                ) or 0
+                                            ),
                                         )
                                     with col_e_m3:
                                         nuevos_min_e = st.number_input(
                                             "Min. Extra:",
                                             min_value=0,
-                                            value=0,
+                                            value=int(
+                                                fila_actual_edit.get(
+                                                    "Horas Extra (min)", 0
+                                                ) or 0
+                                            ),
                                         )
 
                                     if st.button("💾 Guardar Ajuste Manual"):
@@ -7450,6 +7615,10 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     df_asist_fresco["Fecha"]
                                                     == f_edit_sel
                                                 )
+                                                & (
+                                                    df_asist_fresco["Tipo Marcación"]
+                                                    == tipo_a_editar
+                                                )
                                             ].index
 
                                             for idx_mod in indices:
@@ -7464,13 +7633,21 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     idx_mod,
                                                     "Horas Extra (min)",
                                                 ] = nuevos_min_e
+                                                if nueva_hora_registrada is not None:
+                                                    df_asist_fresco.at[
+                                                        idx_mod,
+                                                        "Hora Registrada",
+                                                    ] = nueva_hora_registrada.strftime(
+                                                        "%H:%M:%S"
+                                                    )
 
                                             df_asist_fresco.to_csv(
                                                 CSV_ASISTENCIA, index=False
                                             )
                                         st.success(
-                                            f"Registro del día {f_edit_sel}"
-                                            " actualizado con éxito."
+                                            f"Registro de {tipo_a_editar} del"
+                                            f" día {f_edit_sel} actualizado"
+                                            " con éxito."
                                         )
                                         st.rerun()
                                 else:
@@ -7498,32 +7675,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     )
                 ]
 
-                if not df_asist_emp.empty:
-                    total_puntual = df_asist_emp[
-                        df_asist_emp["Estado"] == "Puntual"
-                    ]["Fecha"].nunique()
-                    total_tardanza = df_asist_emp[
-                        df_asist_emp["Estado"] == "Tardanza"
-                    ]["Fecha"].nunique()
-                    minutos_tardanza_acumulados = df_asist_emp[
-                        "Minutos Tardanza"
-                    ].sum()
-                    minutos_extra_acumulados = df_asist_emp[
-                        "Horas Extra (min)"
-                    ].sum()
-                else:
-                    total_puntual = 0
-                    total_tardanza = 0
-                    minutos_tardanza_acumulados = 0
-                    minutos_extra_acumulados = 0
-
-                horas_tardanza_dec = round(
-                    minutos_tardanza_acumulados / 60.0, 2
-                )
-                formato_hhmm_tardanza = min_a_formato_horas(
-                    minutos_tardanza_acumulados
-                )
-
                 with st.container(border=True):
                     st.markdown(
                         f"#### 📅 Calendario de Asistencia — {mes_ind_sel} {anio_ind_sel}"
@@ -7535,15 +7686,20 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         " por celda, hasta la fecha de hoy."
                     )
 
-                    # Recalcular totales del mes (para el resumen chico
-                    # de arriba del calendario) — misma info que antes
-                    # daban las 4 tarjetas, ahora en una sola línea.
+                    # Solo Entrada cuenta para Puntual/Tardanza (la
+                    # Salida también puede decir "Puntual", y sin este
+                    # filtro un día con Entrada Tardanza + Salida
+                    # Puntual se contaba en los dos a la vez).
+                    _df_asist_emp_entrada = (
+                        df_asist_emp[df_asist_emp["Tipo Marcación"] == "Entrada"]
+                        if not df_asist_emp.empty else df_asist_emp
+                    )
                     if not df_asist_emp.empty:
-                        total_puntual = df_asist_emp[
-                            df_asist_emp["Estado"] == "Puntual"
+                        total_puntual = _df_asist_emp_entrada[
+                            _df_asist_emp_entrada["Estado"] == "Puntual"
                         ]["Fecha"].nunique()
-                        total_tardanza = df_asist_emp[
-                            df_asist_emp["Estado"] == "Tardanza"
+                        total_tardanza = _df_asist_emp_entrada[
+                            _df_asist_emp_entrada["Estado"] == "Tardanza"
                         ]["Fecha"].nunique()
                         minutos_tardanza_acumulados = df_asist_emp[
                             "Minutos Tardanza"
@@ -7576,6 +7732,18 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     for _ in range(_relleno_inicial):
                         _celdas_html.append('<div style="background:transparent;"></div>')
 
+                    # Horario personalizado de ESTE trabajador (si tiene)
+                    # — para que el calendario respete sus días
+                    # específicos, no solo la regla general de la
+                    # empresa (el "enlace" pedido entre Personalizar
+                    # Horario y el Reporte de cada trabajador).
+                    try:
+                        _h_personal_cal = json.loads(
+                            emp_info.get("horario_personalizado", "{}") or "{}"
+                        )
+                    except Exception:
+                        _h_personal_cal = {}
+
                     for d in range(1, num_dias_m + 1):
                         f_eval = date(anio_ind_sel, m_num, d)
                         f_str = f_eval.strftime("%Y-%m-%d")
@@ -7584,6 +7752,16 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         ]
                         ent_reg = df_dia_emp[df_dia_emp["Tipo Marcación"] == "Entrada"]
                         sal_reg = df_dia_emp[df_dia_emp["Tipo Marcación"] == "Salida"]
+
+                        _nombre_dia_cal = DIAS_SEMANA_MAP[f_eval.weekday()]
+                        if _nombre_dia_cal in _h_personal_cal:
+                            _es_laborable_para_el = _h_personal_cal[
+                                _nombre_dia_cal
+                            ].get("activo", True)
+                        else:
+                            _es_laborable_para_el = (
+                                _nombre_dia_cal in st.session_state.dias_laborables
+                            )
 
                         _hora_ent_cal, _hora_sal_cal = "", ""
                         if not ent_reg.empty:
@@ -7597,7 +7775,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         elif f_str in FERIADOS_OFICIALES:
                             color_borde = "#5865f2"
                             etiqueta_dia = "FERIADO"
-                        elif DIAS_SEMANA_MAP[f_eval.weekday()] not in st.session_state.dias_laborables:
+                        elif not _es_laborable_para_el:
                             color_borde = "#3a3f4b"
                             etiqueta_dia = "DESCANSO"
                         else:
@@ -8234,10 +8412,34 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         st.caption(
                             "Define horarios específicos por día para este"
                             " trabajador (Sobrescribe el horario de la sede)."
+                            " Los campos ya vienen precargados con el"
+                            " horario normal de su sede como guía — solo"
+                            " cambia los días que necesites ajustar."
+                        )
+
+                        # Horario de la sede de este trabajador, para
+                        # usarlo como valor de partida en cada día que
+                        # todavía no tenga un horario personalizado
+                        # guardado (antes se precargaba siempre
+                        # 08:00-17:00 fijo, sin relación con su sede
+                        # real).
+                        _sede_emp_h = emp_h_row["sede_principal"]
+                        _datos_sede_h = df_sedes[
+                            df_sedes["nombre_sede"] == _sede_emp_h
+                        ]
+                        _h_ent_sede_default = (
+                            _datos_sede_h["hora_entrada"].values[0]
+                            if not _datos_sede_h.empty
+                            else "08:00:00"
+                        )
+                        _h_sal_sede_default = (
+                            _datos_sede_h["hora_salida"].values[0]
+                            if not _datos_sede_h.empty
+                            else "17:00:00"
                         )
 
                         nuevo_h_dict = {}
-                        cols_dias = st.columns(6)
+                        cols_dias = st.columns(7)
                         dias_semana = [
                             "Lunes",
                             "Martes",
@@ -8245,6 +8447,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                             "Jueves",
                             "Viernes",
                             "Sábado",
+                            "Domingo",
                         ]
 
                         for idx_d, dia in enumerate(dias_semana):
@@ -8253,15 +8456,16 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                 activo = st.checkbox(
                                     "Aplica",
                                     value=h_dict_actual.get(dia, {}).get(
-                                        "activo", True
+                                        "activo",
+                                        dia in st.session_state.dias_laborables,
                                     ),
                                     key=f"chk_{dia}",
                                 )
                                 val_ent = h_dict_actual.get(dia, {}).get(
-                                    "entrada", "08:00:00"
+                                    "entrada", _h_ent_sede_default
                                 )
                                 val_sal = h_dict_actual.get(dia, {}).get(
-                                    "salida", "17:00:00"
+                                    "salida", _h_sal_sede_default
                                 )
 
                                 t_ent = st.time_input(
@@ -8375,6 +8579,51 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                 "Todas las tardanzas se convierten a formato decimal"
                                 " y horas para consolidar informes."
                             )
+
+                    with st.container(border=True):
+                        st.markdown("#### 📆 Días Laborables de la Empresa")
+                        st.caption(
+                            "Marca los días en que esta empresa SÍ trabaja"
+                            " normalmente — se usa para calcular faltas,"
+                            " el calendario de asistencia, y ahora incluye"
+                            " el Domingo como una opción más (antes nunca"
+                            " se podía activar)."
+                        )
+                        _dias_orden = [
+                            "Lunes", "Martes", "Miércoles", "Jueves",
+                            "Viernes", "Sábado", "Domingo",
+                        ]
+                        _cols_dias = st.columns(7)
+                        _dias_marcados = []
+                        for _idx_d, _dia_nom in enumerate(_dias_orden):
+                            with _cols_dias[_idx_d]:
+                                _marcado = st.checkbox(
+                                    _dia_nom,
+                                    value=(
+                                        _dia_nom
+                                        in st.session_state.dias_laborables
+                                    ),
+                                    key=f"chk_dia_lab_{_dia_nom}",
+                                )
+                                if _marcado:
+                                    _dias_marcados.append(_dia_nom)
+
+                        if st.button("💾 Guardar Días Laborables"):
+                            st.session_state.dias_laborables = _dias_marcados
+                            if supabase:
+                                try:
+                                    guardar_configuracion_sistema(
+                                        supabase,
+                                        st.session_state.empresa_id,
+                                        dias_laborables=json.dumps(
+                                            _dias_marcados
+                                        ),
+                                    )
+                                    st.success(
+                                        "✅ Días laborables actualizados."
+                                    )
+                                except Exception as e:
+                                    st.error(f"No se pudo guardar: {e}")
 
                 with subtab_respaldo:
                     st.markdown("#### ☁️ Panel Maestro de SuperAdmin / Respaldo")
