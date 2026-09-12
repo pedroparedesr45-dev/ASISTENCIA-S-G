@@ -6916,7 +6916,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
 
         es_master_o_dev = st.session_state.developer_global
 
-        if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
+        if st.session_state.rol == "master" and not ES_CELULAR:
             if es_master_o_dev:
                 tab_gestion_nombre = "🏢 Gestión de Empresas y Sedes"
             else:
@@ -7745,7 +7745,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         " este mes."
                     )
 
-        if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
+        if st.session_state.rol == "master" and not ES_CELULAR:
             with tab_objs[2]:
                 if es_master_o_dev:
                     st.subheader("🏢 Gestión Integral de Empresas y Sedes SaaS")
