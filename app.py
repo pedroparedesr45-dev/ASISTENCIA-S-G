@@ -2049,20 +2049,25 @@ def guardar_pin_developer_global(supabase, pin_nuevo_hash):
     ).execute()
 
 
-@st.cache_data(ttl=30)
 def cargar_configuracion_sistema(_supabase, empresa_id):
     """Carga PINs, clave de Excel y contraseña por defecto desde Supabase
     para esta empresa (tabla configuracion_sistema). Si no hay fila
     guardada todavía, deja los valores que ya estaban en session_state
     (los de Secrets o los de respaldo).
 
-    OPTIMIZACIÓN: cacheado 30 segundos — esto casi no cambia de un
-    momento a otro (PINs, régimen laboral, logo), así que no hace falta
-    volver a pedirlo a Supabase en cada actualización de pantalla. El
-    parámetro se llama '_supabase' (con guion bajo) a propósito: así le
-    decimos a Streamlit que NO intente cachear basándose en ese objeto
-    (los clientes de Supabase no se pueden "hashear" de forma
-    confiable) — solo cachea según el empresa_id."""
+    BUG SERIO YA CORREGIDO: esta función SÍ tenía @st.cache_data(ttl=30)
+    antes — el problema es que esa caché es GLOBAL (compartida entre
+    TODOS los usuarios/pestañas de la app), mientras que lo que hace
+    esta función es escribir en st.session_state, que es POR SESIÓN.
+    Si dos personas (o dos pestañas tuyas) pedían la config de la misma
+    empresa casi al mismo tiempo, la segunda podía recibir un "no
+    ejecutes de nuevo, ya se hizo" del caché — pero eso significa que
+    SU PROPIA sesión nunca quedaba con el PIN actualizado, aunque
+    Streamlit "creyera" que ya se cargó. Por eso a veces fallaba el PIN
+    aunque estuviera bien escrito, y no era un problema de cuándo se
+    guardó, sino de cuándo se LEYÓ. Se quitó la caché de esta función
+    específica — el costo de rendimiento es mínimo (no se llama a cada
+    tecla) y la corrección del PIN es lo más importante."""
     if not _supabase:
         return
     try:
@@ -2099,22 +2104,13 @@ def cargar_configuracion_sistema(_supabase, empresa_id):
 def guardar_configuracion_sistema(supabase, empresa_id, **campos):
     """Guarda (crea o actualiza) los PINs/clave de esta empresa en
     Supabase, para que el cambio persista de verdad entre sesiones y
-    redespliegues.
-
-    BUG REAL YA CORREGIDO: 'cargar_configuracion_sistema()' está
-    cacheado 30 segundos (para que la app no sea lenta) — pero eso
-    hacía que, justo después de cambiar un PIN, el sistema siguiera
-    comparando contra el PIN VIEJO durante esos 30 segundos, dando
-    "PIN Incorrecto" aunque la contraseña nueva estuviera bien escrita.
-    Limpiar el caché aquí mismo hace que el cambio de PIN aplique de
-    inmediato, sin esperar."""
+    redespliegues."""
     if not supabase:
         raise RuntimeError("El cliente de Supabase no está configurado.")
     datos = {"empresa_id": str(empresa_id), **campos}
     supabase.table("configuracion_sistema").upsert(
         datos, on_conflict="empresa_id"
     ).execute()
-    cargar_configuracion_sistema.clear()
 
 
 def obtener_password_empleado(supabase, empresa_id, dni, password_csv):
