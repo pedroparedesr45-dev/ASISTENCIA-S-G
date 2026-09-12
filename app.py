@@ -7525,108 +7525,142 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 )
 
                 with st.container(border=True):
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric(
-                        "Días Puntuales (Mes)",
-                        f"{total_puntual} días",
-                        delta=f"{total_puntual} de {num_dias_m} días ({mes_ind_sel})",
+                    st.markdown(
+                        f"#### 📅 Calendario de Asistencia — {mes_ind_sel} {anio_ind_sel}"
                     )
-                    m2.metric(
-                        "Días con Tardanza",
-                        f"{total_tardanza} días",
-                        delta=f"{total_tardanza} de {num_dias_m} días ({mes_ind_sel})",
-                        delta_color="inverse",
+                    st.caption(
+                        "Consolidado del mes completo — a diferencia del"
+                        " Dashboard General (que muestra solo el día de"
+                        " hoy en vivo), aquí se arma todo el mes, celda"
+                        " por celda, hasta la fecha de hoy."
                     )
-                    m3.metric(
-                        "Horas Tardanza Acumuladas",
-                        f"{horas_tardanza_dec} hrs",
-                        delta=formato_hhmm_tardanza,
-                        delta_color="inverse",
-                    )
-                    m4.metric(
-                        "Minutos Extras Trabajados",
-                        f"{minutos_extra_acumulados} min",
-                        delta=min_a_formato_horas(minutos_extra_acumulados),
-                    )
-                    if minutos_extra_acumulados > 0:
-                        if st.session_state.permitir_horas_extra:
-                            st.caption(
-                                "✅ Esta empresa reconoce y paga horas"
-                                " extra — estos minutos sí se están"
-                                " calculando en la Planilla."
-                            )
-                        else:
-                            st.caption(
-                                "ℹ️ Esta empresa tiene las horas extra"
-                                " desactivadas — estos minutos quedan"
-                                " registrados como referencia, pero no"
-                                " se pagan en la Planilla."
-                            )
 
-                    st.divider()
+                    # Recalcular totales del mes (para el resumen chico
+                    # de arriba del calendario) — misma info que antes
+                    # daban las 4 tarjetas, ahora en una sola línea.
+                    if not df_asist_emp.empty:
+                        total_puntual = df_asist_emp[
+                            df_asist_emp["Estado"] == "Puntual"
+                        ]["Fecha"].nunique()
+                        total_tardanza = df_asist_emp[
+                            df_asist_emp["Estado"] == "Tardanza"
+                        ]["Fecha"].nunique()
+                        minutos_tardanza_acumulados = df_asist_emp[
+                            "Minutos Tardanza"
+                        ].sum()
+                        minutos_extra_acumulados = df_asist_emp[
+                            "Horas Extra (min)"
+                        ].sum()
+                    else:
+                        total_puntual = 0
+                        total_tardanza = 0
+                        minutos_tardanza_acumulados = 0
+                        minutos_extra_acumulados = 0
 
-                    st.markdown("#### 📊 Comportamiento Diario de Asistencia")
-                    timeline_data = []
+                    _resumen_extra = ""
+                    if minutos_extra_acumulados > 0 and st.session_state.permitir_horas_extra:
+                        _resumen_extra = (
+                            f" · ⏱ {minutos_extra_acumulados} min extra"
+                        )
+                    st.markdown(
+                        f"**{total_puntual}** días puntuales &nbsp;·&nbsp;"
+                        f" **{total_tardanza}** con tardanza"
+                        f"{_resumen_extra}"
+                    )
+
+                    # --- Construcción del calendario, celda por celda ---
+                    _primer_dia_mes = date(anio_ind_sel, m_num, 1)
+                    _relleno_inicial = _primer_dia_mes.weekday()  # 0=Lunes
+
+                    _celdas_html = []
+                    for _ in range(_relleno_inicial):
+                        _celdas_html.append('<div style="background:transparent;"></div>')
+
                     for d in range(1, num_dias_m + 1):
                         f_eval = date(anio_ind_sel, m_num, d)
                         f_str = f_eval.strftime("%Y-%m-%d")
-
                         df_dia_emp = df_asist_emp[
                             df_asist_emp["Fecha"].astype(str).str.slice(0, 10) == f_str
                         ]
-                        ent_reg = df_dia_emp[
-                            df_dia_emp["Tipo Marcación"] == "Entrada"
-                        ]
+                        ent_reg = df_dia_emp[df_dia_emp["Tipo Marcación"] == "Entrada"]
+                        sal_reg = df_dia_emp[df_dia_emp["Tipo Marcación"] == "Salida"]
 
+                        _hora_ent_cal, _hora_sal_cal = "", ""
                         if not ent_reg.empty:
-                            est = ent_reg.iloc[0]["Estado"]
-                            val_y = 2 if est == "Puntual" else 1
-                            timeline_data.append({
-                                "Día": d,
-                                "Estado": est.upper(),
-                                "Nivel": val_y,
-                            })
+                            est_dia = ent_reg.iloc[0]["Estado"]
+                            _hora_ent_cal = str(ent_reg.iloc[0].get("Hora Registrada", ""))
+                            color_borde = "#00B050" if est_dia == "Puntual" else "#FF8C00"
+                            etiqueta_dia = est_dia.upper()
                         elif f_eval > hoy_peru():
-                            pass  # día futuro: no hay nada que marcar todavía
+                            color_borde = "#2d3340"
+                            etiqueta_dia = ""
                         elif f_str in FERIADOS_OFICIALES:
-                            pass  # feriado oficial: no cuenta como falta
-                        elif DIAS_SEMANA_MAP[f_eval.weekday()] in st.session_state.dias_laborables:
-                            # Día laborable, sin ninguna marcación de
-                            # Entrada: es una falta real.
-                            timeline_data.append({
-                                "Día": d,
-                                "Estado": "FALTA",
-                                "Nivel": 0.5,
-                            })
+                            color_borde = "#5865f2"
+                            etiqueta_dia = "FERIADO"
+                        elif DIAS_SEMANA_MAP[f_eval.weekday()] not in st.session_state.dias_laborables:
+                            color_borde = "#3a3f4b"
+                            etiqueta_dia = "DESCANSO"
+                        else:
+                            color_borde = "#C00000"
+                            etiqueta_dia = "FALTA"
 
-                    if timeline_data:
-                        df_tl = pd.DataFrame(timeline_data)
-                        fig_tl = px.bar(
-                            df_tl,
-                            x="Día",
-                            y="Nivel",
-                            color="Estado",
-                            color_discrete_map={
-                                "PUNTUAL": "#2EB67D",
-                                "TARDANZA": "#FF8C00",
-                                "FALTA": "#FF6B6B",
-                            },
-                            height=260,
-                        )
-                        fig_tl.update_layout(
-                            yaxis=dict(
-                                tickmode="array",
-                                tickvals=[0.5, 1, 2],
-                                ticktext=["FALTA", "TARDANZA", "PUNTUAL"],
-                            ),
-                            xaxis=dict(dtick=1),
-                            margin=dict(l=10, r=10, t=10, b=10),
-                        )
-                        st.plotly_chart(
-                            fig_tl,
-                            use_container_width=True,
-                            key=f"tl_clean_{emp_ind_sel}",
-                        )
+                        if not sal_reg.empty:
+                            _hora_sal_cal = str(sal_reg.iloc[0].get("Hora Registrada", ""))
+                            _hora_ofic_sal_cal = str(sal_reg.iloc[0].get("Hora Salida Oficial", ""))
+                            _sal_puntual_cal = (
+                                _hora_sal_cal >= _hora_ofic_sal_cal
+                                if _hora_ofic_sal_cal else True
+                            )
+                            _color_sal_cal = "#00B050" if _sal_puntual_cal else "#FFAB40"
+                        else:
+                            _color_sal_cal = "#8b949e"
+
+                        _horas_html = ""
+                        if _hora_ent_cal or _hora_sal_cal:
+                            _horas_html = f"""
+                            <div style="font-size:9px; color:#8b949e; margin-top:3px;">
+                                {"🕐 " + _hora_ent_cal if _hora_ent_cal else ""}
+                            </div>
+                            <div style="font-size:9px; color:{_color_sal_cal}; margin-top:1px;">
+                                {"🚪 " + _hora_sal_cal if _hora_sal_cal else ""}
+                            </div>
+                            """
+
+                        _celdas_html.append(f"""
+                        <div style="border:2px solid {color_borde};
+                            border-radius:8px; padding:6px 4px;
+                            background:rgba(255,255,255,0.02);
+                            min-height:74px;">
+                            <div style="font-size:12px; font-weight:700;
+                                color:#e6edf3;">{d}</div>
+                            <div style="font-size:9px; font-weight:700;
+                                color:{color_borde}; margin-top:2px;
+                                line-height:1.2;">{etiqueta_dia}</div>
+                            {_horas_html}
+                        </div>
+                        """)
+
+                    _dias_semana_header = "".join(
+                        f'<div style="text-align:center; font-size:11px; '
+                        f'font-weight:700; color:#8b949e;">{d}</div>'
+                        for d in ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
+                    )
+
+                    render_html(f"""
+                    <div style="display:grid; grid-template-columns:repeat(7,1fr);
+                        gap:4px; margin-bottom:4px;">
+                        {_dias_semana_header}
+                    </div>
+                    <div style="display:grid; grid-template-columns:repeat(7,1fr);
+                        gap:6px;">
+                        {''.join(_celdas_html)}
+                    </div>
+                    """)
+
+                    st.caption(
+                        "🟢 Puntual · 🟠 Tardanza · 🔴 Falta · 🔵 Feriado ·"
+                        " ⚪ Descanso (no laborable) · ⬛ Todavía no llega ese día"
+                    )
 
                 st.markdown(
                     "#### 🔍 Bitácora de Marcaciones, Fotos y Verificación GPS"
