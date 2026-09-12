@@ -6848,6 +6848,47 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             f" ({st.session_state.entorno})"
         )
 
+        if st.session_state.developer_global:
+            # Selector GLOBAL (no encerrado en una sola pestaña) — así
+            # cualquier cambio que hagas en CUALQUIER pestaña (Ajustes,
+            # Personal, Planilla, lo que sea) se guarda de verdad en la
+            # empresa que elegiste aquí, no en DEV_TEST por error (bug
+            # real ya corregido: antes este selector solo vivía dentro
+            # de "Reporte Limpio" y se revertía al salir de esa
+            # pestaña — si cambiabas un PIN desde Ajustes mientras
+            # estabas "prestado" a otra empresa, en realidad se
+            # guardaba en DEV_TEST).
+            _todas_las_empresas_glob = cargar_empresas()
+            if not _todas_las_empresas_glob.empty:
+                _opciones_emp_glob = list(
+                    _todas_las_empresas_glob["empresa_id"].unique()
+                )
+                _empresa_override_glob = st.selectbox(
+                    "🧪 Developer: trabajar sobre la empresa",
+                    _opciones_emp_glob,
+                    index=(
+                        _opciones_emp_glob.index(st.session_state.empresa_id)
+                        if st.session_state.empresa_id in _opciones_emp_glob
+                        else 0
+                    ),
+                    help=(
+                        "Exclusivo Developer — aquí puedes elegir CUALQUIER"
+                        " empresa (incluidas las de Producción) y todo lo"
+                        " que hagas en cualquier pestaña de aquí en"
+                        " adelante (Ajustes, Personal, Planilla, etc.)"
+                        " aplica a la empresa que elijas, hasta que"
+                        " cambies de nuevo o cierres sesión."
+                    ),
+                    key="selector_empresa_developer_global",
+                )
+                if _empresa_override_glob != st.session_state.empresa_id:
+                    st.session_state.empresa_id = _empresa_override_glob
+                    cargar_configuracion_sistema(supabase, _empresa_override_glob)
+                    df_sedes, df_empleados, df_asistencia = cargar_datos(
+                        _empresa_override_glob
+                    )
+                    st.rerun()
+
         _tablas_locales = st.session_state.get("tablas_en_modo_local", set())
         if _tablas_locales:
             _nombres_visibles = {
@@ -7045,43 +7086,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
 
         with tab_objs[1]:
             st.markdown("### 👤 Reporte e Inspección Detallada por Trabajador")
-
-            # Guarda los datos originales de ESTA sesión (DEV_TEST si
-            # entraste como Developer) para restaurarlos al final de
-            # esta pestaña — así lo de abajo no se filtra a las demás
-            # pestañas.
-            _df_empleados_original_t1 = df_empleados
-            _df_asistencia_original_t1 = df_asistencia
-            _df_sedes_original_t1 = df_sedes
-            _empresa_id_original_t1 = st.session_state.empresa_id
-
-            if st.session_state.developer_global:
-                _todas_las_empresas_t1 = cargar_empresas()
-                if not _todas_las_empresas_t1.empty:
-                    _empresa_override_t1 = st.selectbox(
-                        "🧪 Developer: inspeccionar/regularizar datos de"
-                        " qué empresa:",
-                        _todas_las_empresas_t1["empresa_id"].unique(),
-                        index=(
-                            list(
-                                _todas_las_empresas_t1["empresa_id"].unique()
-                            ).index(st.session_state.empresa_id)
-                            if st.session_state.empresa_id
-                            in _todas_las_empresas_t1["empresa_id"].unique()
-                            else 0
-                        ),
-                        help=(
-                            "Exclusivo Developer — aquí SÍ puedes elegir"
-                            " empresas de Producción para revisar o"
-                            " regularizar su asistencia, sin salir de"
-                            " DEV_TEST en el resto de la app."
-                        ),
-                    )
-                    if _empresa_override_t1 != st.session_state.empresa_id:
-                        df_sedes, df_empleados, df_asistencia = cargar_datos(
-                            _empresa_override_t1
-                        )
-                        st.session_state.empresa_id = _empresa_override_t1
 
             with st.container(border=True):
                 c_e1, c_e2, c_e3 = st.columns([3, 1.5, 1.5])
@@ -7740,15 +7744,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         "No existen registros o evaluaciones disponibles para"
                         " este mes."
                     )
-
-            # Restaura los datos originales de la sesión (DEV_TEST, si
-            # entraste como Developer) — lo de arriba (ver el selector
-            # 'Developer: inspeccionar/regularizar...') NO debe afectar
-            # a las demás pestañas de aquí en adelante.
-            df_empleados = _df_empleados_original_t1
-            df_asistencia = _df_asistencia_original_t1
-            df_sedes = _df_sedes_original_t1
-            st.session_state.empresa_id = _empresa_id_original_t1
 
         if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
             with tab_objs[2]:
