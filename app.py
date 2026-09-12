@@ -630,6 +630,47 @@ def render_animacion_marcado_exitoso(logo_url, hora_texto, estado="Puntual", rac
     render_sonido_sello(delay_ms=200, grave=not es_tardanza)
 
 
+def render_tarjetas_asistencia_hoy(df_lista_empleados, mapa_estado, mapa_hora, cols_por_fila=4):
+    """Dibuja la cuadrícula de tarjetas de '¿Quién marcó hoy?' — una
+    tarjeta por trabajador con su nombre, si ya marcó (Puntual/
+    Tardanza) o no (Sin Marcar), y la hora si corresponde. Reutilizable
+    tanto para el resumen general como para cada sede por separado."""
+    lista = list(df_lista_empleados.sort_values("nombre").iterrows())
+    for i in range(0, len(lista), cols_por_fila):
+        fila_cols = st.columns(cols_por_fila)
+        for j, (_, emp) in enumerate(lista[i:i + cols_por_fila]):
+            nombre_emp = emp["nombre"]
+            estado = mapa_estado.get(nombre_emp)
+            if estado == "Puntual":
+                color, icono, texto = "#00B050", "✅", "PUNTUAL"
+            elif estado == "Tardanza":
+                color, icono, texto = "#FF8C00", "🟠", "TARDANZA"
+            else:
+                color, icono, texto = "#C00000", "⏳", "SIN MARCAR"
+            hora = mapa_hora.get(nombre_emp, "")
+            with fila_cols[j]:
+                render_html(f"""
+                <div style="border:2px solid {color};
+                    border-radius:12px; padding:10px 12px;
+                    margin-bottom:8px;
+                    background:rgba(255,255,255,0.03);">
+                    <div style="font-size:13px; font-weight:600;
+                        color:#e6edf3; white-space:nowrap;
+                        overflow:hidden; text-overflow:ellipsis;">
+                        {nombre_emp}
+                    </div>
+                    <div style="font-size:12px; color:{color};
+                        font-weight:700; margin-top:4px;">
+                        {icono} {texto}
+                    </div>
+                    <div style="font-size:11px; color:#8b949e;
+                        margin-top:2px;">
+                        {hora if hora else "&nbsp;"}
+                    </div>
+                </div>
+                """)
+
+
 def calcular_racha_puntualidad(df_asistencia, nombre_empleado):
     """Cuenta cuántos días PUNTUALES seguidos lleva el trabajador en sus
     marcaciones de Entrada, contando hacia atrás desde la más reciente
@@ -2016,13 +2057,22 @@ def cargar_configuracion_sistema(_supabase, empresa_id):
 def guardar_configuracion_sistema(supabase, empresa_id, **campos):
     """Guarda (crea o actualiza) los PINs/clave de esta empresa en
     Supabase, para que el cambio persista de verdad entre sesiones y
-    redespliegues."""
+    redespliegues.
+
+    BUG REAL YA CORREGIDO: 'cargar_configuracion_sistema()' está
+    cacheado 30 segundos (para que la app no sea lenta) — pero eso
+    hacía que, justo después de cambiar un PIN, el sistema siguiera
+    comparando contra el PIN VIEJO durante esos 30 segundos, dando
+    "PIN Incorrecto" aunque la contraseña nueva estuviera bien escrita.
+    Limpiar el caché aquí mismo hace que el cambio de PIN aplique de
+    inmediato, sin esperar."""
     if not supabase:
         raise RuntimeError("El cliente de Supabase no está configurado.")
     datos = {"empresa_id": str(empresa_id), **campos}
     supabase.table("configuracion_sistema").upsert(
         datos, on_conflict="empresa_id"
     ).execute()
+    cargar_configuracion_sistema.clear()
 
 
 def obtener_password_empleado(supabase, empresa_id, dni, password_csv):
@@ -6927,49 +6977,9 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             cq3.metric("🟠 Con tardanza hoy", _total_tardanza_dash)
             cq4.metric("🔴 Sin marcar todavía", _total_sin_marcar_dash)
 
-            _cols_por_fila = 4
-            _lista_emp_dash = list(df_empleados.sort_values("nombre").iterrows())
-            for _i in range(0, len(_lista_emp_dash), _cols_por_fila):
-                _fila_cols = st.columns(_cols_por_fila)
-                for _j, (_, _emp_dash) in enumerate(
-                    _lista_emp_dash[_i:_i + _cols_por_fila]
-                ):
-                    _nombre_emp_dash = _emp_dash["nombre"]
-                    _estado_dash = _map_estado_hoy.get(_nombre_emp_dash)
-                    if _estado_dash == "Puntual":
-                        _color_dash, _icono_dash, _texto_dash = (
-                            "#00B050", "✅", "PUNTUAL",
-                        )
-                    elif _estado_dash == "Tardanza":
-                        _color_dash, _icono_dash, _texto_dash = (
-                            "#FF8C00", "🟠", "TARDANZA",
-                        )
-                    else:
-                        _color_dash, _icono_dash, _texto_dash = (
-                            "#C00000", "⏳", "SIN MARCAR",
-                        )
-                    _hora_dash = _map_hora_hoy.get(_nombre_emp_dash, "")
-                    with _fila_cols[_j]:
-                        render_html(f"""
-                        <div style="border:2px solid {_color_dash};
-                            border-radius:12px; padding:10px 12px;
-                            margin-bottom:8px;
-                            background:rgba(255,255,255,0.03);">
-                            <div style="font-size:13px; font-weight:600;
-                                color:#e6edf3; white-space:nowrap;
-                                overflow:hidden; text-overflow:ellipsis;">
-                                {_nombre_emp_dash}
-                            </div>
-                            <div style="font-size:12px; color:{_color_dash};
-                                font-weight:700; margin-top:4px;">
-                                {_icono_dash} {_texto_dash}
-                            </div>
-                            <div style="font-size:11px; color:#8b949e;
-                                margin-top:2px;">
-                                {_hora_dash if _hora_dash else "&nbsp;"}
-                            </div>
-                        </div>
-                        """)
+            render_tarjetas_asistencia_hoy(
+                df_empleados, _map_estado_hoy, _map_hora_hoy
+            )
 
             st.divider()
 
@@ -6985,106 +6995,50 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                             "No hay personal asignado a esta sede como principal."
                         )
                     else:
-                        k1, k2, k3, k4 = st.columns(4)
-                        tot_p, tot_t, tot_min_t, tot_min_e = 0, 0, 0, 0
-
-                        for _, emp_row in emps_sede.iterrows():
-                            df_emp_a = df_asistencia[
-                                (df_asistencia["Empleado"] == emp_row["nombre"])
-                                & (
-                                    df_asistencia["Fecha"]
-                                    .astype(str)
-                                    .str.startswith(prefix_filtro)
-                                )
-                            ]
-                            if not df_emp_a.empty:
-                                tot_p += df_emp_a[df_emp_a["Estado"] == "Puntual"][
-                                    "Fecha"
-                                ].nunique()
-                                tot_t += df_emp_a[df_emp_a["Estado"] == "Tardanza"][
-                                    "Fecha"
-                                ].nunique()
-                                tot_min_t += df_emp_a["Minutos Tardanza"].sum()
-                                tot_min_e += df_emp_a["Horas Extra (min)"].sum()
-
-                        max_dias_posibles = len(emps_sede) * num_dias_mes_gen
-
-                        hrs_dec_sede = round(tot_min_t / 60.0, 1)
-                        fmt_hm_sede = min_a_formato_horas(tot_min_t)
-
-                        k1.metric("Personal Afiliado", f"{len(emps_sede)} emps")
-                        k2.metric(
-                            "Puntualidades Totales",
-                            f"{tot_p} días",
-                            delta=f"{tot_p} de {max_dias_posibles} días-persona",
-                        )
-                    
-                        if es_mejora_activa(st.session_state.entorno):
-                            k3.metric(
-                                label="Horas Tardanza Sede",
-                                value=f"{hrs_dec_sede} hrs",
-                                delta=f"({fmt_hm_sede})",
-                                delta_color="off"
-                            )
-                        else:
-                            k3.metric("Horas Tardanza Sede", f"{round(tot_min_t / 60.0, 2)} hrs")
-
-                        k4.metric("Minutos Extras Totales", f"{tot_min_e} min")
-
-                        st.markdown("**Personal de la Sede:**")
-                        df_resumen_local = []
-                        for _, emp_row in emps_sede.iterrows():
-                            df_emp_a = df_asistencia[
-                                (df_asistencia["Empleado"] == emp_row["nombre"])
-                                & (
-                                    df_asistencia["Fecha"]
-                                    .astype(str)
-                                    .str.startswith(prefix_filtro)
-                                )
-                            ]
-                            p_cnt = (
-                                df_emp_a[df_emp_a["Estado"] == "Puntual"][
-                                    "Fecha"
-                                ].nunique()
-                                if not df_emp_a.empty
-                                else 0
-                            )
-                            t_cnt = (
-                                df_emp_a[df_emp_a["Estado"] == "Tardanza"][
-                                    "Fecha"
-                                ].nunique()
-                                if not df_emp_a.empty
-                                else 0
-                            )
-                            m_sum = (
-                                df_emp_a["Minutos Tardanza"].sum()
-                                if not df_emp_a.empty
-                                else 0
-                            )
-                            e_sum = (
-                                df_emp_a["Horas Extra (min)"].sum()
-                                if not df_emp_a.empty
-                                else 0
-                            )
-
-                            df_resumen_local.append({
-                                "DNI": emp_row["dni"],
-                                "Nombre": emp_row["nombre"],
-                                "Cargo": emp_row["cargo"],
-                                "Días Puntuales": f"{p_cnt} / {num_dias_mes_gen}",
-                                "Tardanzas": t_cnt,
-                                "Horas Tardanza": round(m_sum / 60.0, 2),
-                                "Min. Extras": e_sum,
-                            })
-                        st.dataframe(
-                            pd.DataFrame(df_resumen_local),
-                            use_container_width=True,
-                            hide_index=True,
+                        render_tarjetas_asistencia_hoy(
+                            emps_sede, _map_estado_hoy, _map_hora_hoy
                         )
                 st.write("")
 
         with tab_objs[1]:
             st.markdown("### 👤 Reporte e Inspección Detallada por Trabajador")
+
+            # Guarda los datos originales de ESTA sesión (DEV_TEST si
+            # entraste como Developer) para restaurarlos al final de
+            # esta pestaña — así lo de abajo no se filtra a las demás
+            # pestañas.
+            _df_empleados_original_t1 = df_empleados
+            _df_asistencia_original_t1 = df_asistencia
+            _df_sedes_original_t1 = df_sedes
+            _empresa_id_original_t1 = st.session_state.empresa_id
+
+            if st.session_state.developer_global:
+                _todas_las_empresas_t1 = cargar_empresas()
+                if not _todas_las_empresas_t1.empty:
+                    _empresa_override_t1 = st.selectbox(
+                        "🧪 Developer: inspeccionar/regularizar datos de"
+                        " qué empresa:",
+                        _todas_las_empresas_t1["empresa_id"].unique(),
+                        index=(
+                            list(
+                                _todas_las_empresas_t1["empresa_id"].unique()
+                            ).index(st.session_state.empresa_id)
+                            if st.session_state.empresa_id
+                            in _todas_las_empresas_t1["empresa_id"].unique()
+                            else 0
+                        ),
+                        help=(
+                            "Exclusivo Developer — aquí SÍ puedes elegir"
+                            " empresas de Producción para revisar o"
+                            " regularizar su asistencia, sin salir de"
+                            " DEV_TEST en el resto de la app."
+                        ),
+                    )
+                    if _empresa_override_t1 != st.session_state.empresa_id:
+                        df_sedes, df_empleados, df_asistencia = cargar_datos(
+                            _empresa_override_t1
+                        )
+                        st.session_state.empresa_id = _empresa_override_t1
 
             with st.container(border=True):
                 c_e1, c_e2, c_e3 = st.columns([3, 1.5, 1.5])
@@ -7145,7 +7099,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                 if es_autorizado_edicion:
                     with st.expander(
                         "🛠️ Herramientas Avanzadas de Regularización de"
-                        " Asistencia (Exclusivo SuperAdmin / Dev)",
+                        " Asistencia",
                         expanded=False,
                     ):
                         st.caption(
@@ -7165,6 +7119,16 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                 " días laborables transcurridos sin registro del"
                                 " mes seleccionado."
                             )
+                            _fecha_ingreso_visible = emp_info.get(
+                                "fecha_ingreso", ""
+                            )
+                            if _fecha_ingreso_visible:
+                                st.caption(
+                                    f"📌 Nunca regulariza antes de la fecha de"
+                                    f" ingreso real: **{_fecha_ingreso_visible}**"
+                                    " — así el trabajador se haya dado de alta"
+                                    " en el sistema mucho después."
+                                )
 
                             if st.button(
                                 "⚡ Marcar Entrada/Salida Puntual Masiva",
@@ -7182,6 +7146,17 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     )
                                 )
 
+                                # RESTRICCIÓN: nunca se puede regularizar
+                                # antes de la fecha de ingreso REAL del
+                                # trabajador (así haya sido dado de alta
+                                # en el sistema mucho después) — ni
+                                # SuperAdmin ni Developer pueden crear
+                                # marcaciones de un día en que la persona
+                                # ni siquiera había sido contratada.
+                                _fecha_ingreso_emp_reg = _parsear_fecha_flexible(
+                                    emp_info.get("fecha_ingreso", "")
+                                ) or date(1900, 1, 1)
+
                                 nuevos_registros_regularizados = []
                                 cant_creados = 0
 
@@ -7192,6 +7167,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
 
                                     if (
                                         f_reg <= hoy_actual
+                                        and f_reg >= _fecha_ingreso_emp_reg
                                         and f_reg_str not in FERIADOS_OFICIALES
                                         and nom_d_reg
                                         in st.session_state.dias_laborables
@@ -7305,9 +7281,36 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     )
 
                         with col_reg2:
+                            # SuperAdmin (o Developer, ambos con rol
+                            # "master") SÍ pueden regularizar días CON
+                            # foto — Admin normal solo puede tocar días
+                            # SIN foto, como antes. La marcación con
+                            # foto es la prueba más fuerte de que
+                            # alguien sí estuvo ahí, así que solo el
+                            # nivel más alto puede corregirla (por
+                            # ejemplo, si el reconocimiento de rostro
+                            # falló pero la persona sí marcó).
+                            # CORREGIDO: solo Developer (PIN 9999,
+                            # developer_global) puede editar días CON
+                            # foto — SuperAdmin ya NO tiene esta
+                            # capacidad (se le dio antes, pero se
+                            # corrigió: su único poder extra es el
+                            # rellenado masivo hacia atrás, más abajo).
+                            # La marcación con foto es la prueba más
+                            # fuerte de que alguien sí estuvo ahí, así
+                            # que solo Developer puede corregirla (por
+                            # ejemplo, si el reconocimiento de rostro
+                            # falló pero la persona sí marcó).
+                            _puede_editar_con_foto = (
+                                st.session_state.developer_global
+                            )
                             st.markdown(
-                                "##### 2️⃣ Edición Individual (Solo Días Sin"
-                                " Foto)"
+                                "##### 2️⃣ Edición Individual "
+                                + (
+                                    "(Incluye días CON foto — exclusivo Developer)"
+                                    if _puede_editar_con_foto
+                                    else "(Solo Días Sin Foto)"
+                                )
                             )
 
                             df_asist_actual = (
@@ -7317,6 +7320,17 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                             )
 
                             if not df_asist_actual.empty:
+                                _condicion_foto = True  # por defecto, sin filtrar
+                                if not _puede_editar_con_foto:
+                                    _condicion_foto = (
+                                        df_asist_actual["Foto"].isna()
+                                        | (
+                                            df_asist_actual["Foto"]
+                                            .astype(str)
+                                            .str.strip()
+                                            == ""
+                                        )
+                                    )
                                 mask_ed = (
                                     (
                                         df_asist_actual["empresa_id"].astype(str)
@@ -7331,15 +7345,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         .astype(str)
                                         .str.startswith(prefix_ind)
                                     )
-                                    & (
-                                        df_asist_actual["Foto"].isna()
-                                        | (
-                                            df_asist_actual["Foto"]
-                                            .astype(str)
-                                            .str.strip()
-                                            == ""
-                                        )
-                                    )
+                                    & _condicion_foto
                                 )
                                 df_editables = df_asist_actual[mask_ed]
 
@@ -7348,8 +7354,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         df_editables["Fecha"].unique()
                                     )
                                     f_edit_sel = st.selectbox(
-                                        "Seleccione la Fecha sin foto a"
-                                        " modificar:",
+                                        "Seleccione la Fecha a modificar:",
                                         fechas_disponibles,
                                     )
 
@@ -7423,10 +7428,18 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         st.rerun()
                                 else:
                                     st.caption(
-                                        "🔒 No hay registros sin foto para este"
-                                        " mes. Las marcaciones reales tomadas"
-                                        " con cámara no pueden ser editadas"
-                                        " manualmente."
+                                        "🔒 No hay registros disponibles"
+                                        " para editar este mes."
+                                        if _puede_editar_con_foto
+                                        else (
+                                            "🔒 No hay registros sin foto"
+                                            " para este mes. Las"
+                                            " marcaciones reales tomadas"
+                                            " con cámara no pueden ser"
+                                            " editadas manualmente por"
+                                            " Admin ni SuperAdmin — solo"
+                                            " Developer puede hacerlo."
+                                        )
                                     )
 
                 df_asist_emp = df_asistencia[
@@ -7650,6 +7663,15 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         "No existen registros o evaluaciones disponibles para"
                         " este mes."
                     )
+
+            # Restaura los datos originales de la sesión (DEV_TEST, si
+            # entraste como Developer) — lo de arriba (ver el selector
+            # 'Developer: inspeccionar/regularizar...') NO debe afectar
+            # a las demás pestañas de aquí en adelante.
+            df_empleados = _df_empleados_original_t1
+            df_asistencia = _df_asistencia_original_t1
+            df_sedes = _df_sedes_original_t1
+            st.session_state.empresa_id = _empresa_id_original_t1
 
         if st.session_state.rol in ["admin", "master"] and not ES_CELULAR:
             with tab_objs[2]:
