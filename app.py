@@ -483,7 +483,8 @@ def render_animacion_verificando(logo_url):
     así que desaparece sola en el siguiente rerun, sin necesitar ningún
     JavaScript de limpieza que se pueda romper."""
     html = f"""
-    <div style="position:fixed; inset:0; z-index:9998;
+    <div style="position:fixed; top:0; left:0; width:100vw; height:100vh;
+        z-index:999999;
         background:rgba(10,14,26,0.95); display:flex;
         flex-direction:column; align-items:center; justify-content:center;
         animation:fac-desvanecer-verif 0.4s ease 1.6s forwards;">
@@ -587,7 +588,8 @@ def render_animacion_marcado_exitoso(logo_url, hora_texto, estado="Puntual", rac
         else ""
     )
     html = f"""
-    <div style="position:fixed; inset:0; z-index:9998;
+    <div style="position:fixed; top:0; left:0; width:100vw; height:100vh;
+        z-index:999999;
         display:flex; align-items:center; justify-content:center;
         background:rgba(10,14,26,0.6); pointer-events:none;
         animation:fac-desvanecer-sello 0.4s ease 2.2s forwards;">
@@ -6887,6 +6889,87 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     "Minutos Extras del Mes",
                     f"{int(df_mes_general['Horas Extra (min)'].sum()) if not df_mes_general.empty else 0} min",
                 )
+
+            st.divider()
+
+            # --- NUEVO: "¿Quién marcó hoy?" — cuadrícula en tiempo real
+            # con TODOS los trabajadores, su check de si ya marcaron y
+            # su estado (Puntual/Tardanza/Sin marcar). Se actualiza
+            # solo, junto con el auto-refresco que ya tiene el
+            # Dashboard. ---
+            st.markdown("### 🟢 ¿Quién marcó hoy?")
+            _hoy_str_dash = ahora_peru().strftime("%Y-%m-%d")
+            _asist_hoy = df_asistencia[
+                (df_asistencia["Fecha"].astype(str).str.slice(0, 10) == _hoy_str_dash)
+                & (df_asistencia["Tipo Marcación"] == "Entrada")
+            ]
+            _map_estado_hoy = {}
+            _map_hora_hoy = {}
+            if not _asist_hoy.empty:
+                for _, _fila_hoy in _asist_hoy.iterrows():
+                    _map_estado_hoy[_fila_hoy["Empleado"]] = _fila_hoy["Estado"]
+                    _map_hora_hoy[_fila_hoy["Empleado"]] = _fila_hoy.get(
+                        "Hora Registrada", ""
+                    )
+
+            _total_emp_dash = len(df_empleados)
+            _total_puntual_dash = sum(
+                1 for v in _map_estado_hoy.values() if v == "Puntual"
+            )
+            _total_tardanza_dash = sum(
+                1 for v in _map_estado_hoy.values() if v == "Tardanza"
+            )
+            _total_sin_marcar_dash = _total_emp_dash - len(_map_estado_hoy)
+
+            cq1, cq2, cq3, cq4 = st.columns(4)
+            cq1.metric("👥 Total Personal", _total_emp_dash)
+            cq2.metric("🟢 Puntuales hoy", _total_puntual_dash)
+            cq3.metric("🟠 Con tardanza hoy", _total_tardanza_dash)
+            cq4.metric("🔴 Sin marcar todavía", _total_sin_marcar_dash)
+
+            _cols_por_fila = 4
+            _lista_emp_dash = list(df_empleados.sort_values("nombre").iterrows())
+            for _i in range(0, len(_lista_emp_dash), _cols_por_fila):
+                _fila_cols = st.columns(_cols_por_fila)
+                for _j, (_, _emp_dash) in enumerate(
+                    _lista_emp_dash[_i:_i + _cols_por_fila]
+                ):
+                    _nombre_emp_dash = _emp_dash["nombre"]
+                    _estado_dash = _map_estado_hoy.get(_nombre_emp_dash)
+                    if _estado_dash == "Puntual":
+                        _color_dash, _icono_dash, _texto_dash = (
+                            "#00B050", "✅", "PUNTUAL",
+                        )
+                    elif _estado_dash == "Tardanza":
+                        _color_dash, _icono_dash, _texto_dash = (
+                            "#FF8C00", "🟠", "TARDANZA",
+                        )
+                    else:
+                        _color_dash, _icono_dash, _texto_dash = (
+                            "#C00000", "⏳", "SIN MARCAR",
+                        )
+                    _hora_dash = _map_hora_hoy.get(_nombre_emp_dash, "")
+                    with _fila_cols[_j]:
+                        render_html(f"""
+                        <div style="border:2px solid {_color_dash};
+                            border-radius:12px; padding:10px 12px;
+                            margin-bottom:8px;
+                            background:rgba(255,255,255,0.03);">
+                            <div style="font-size:13px; font-weight:600;
+                                color:#e6edf3; white-space:nowrap;
+                                overflow:hidden; text-overflow:ellipsis;">
+                                {_nombre_emp_dash}
+                            </div>
+                            <div style="font-size:12px; color:{_color_dash};
+                                font-weight:700; margin-top:4px;">
+                                {_icono_dash} {_texto_dash}
+                            </div>
+                            <div style="font-size:11px; color:#8b949e;
+                                margin-top:2px;">
+                                {_hora_dash if _hora_dash else "&nbsp;"}
+                            </div>
+                        </div>
+                        """)
 
             st.divider()
 
