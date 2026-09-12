@@ -630,11 +630,22 @@ def render_animacion_marcado_exitoso(logo_url, hora_texto, estado="Puntual", rac
     render_sonido_sello(delay_ms=200, grave=not es_tardanza)
 
 
-def render_tarjetas_asistencia_hoy(df_lista_empleados, mapa_estado, mapa_hora, cols_por_fila=4):
+def render_tarjetas_asistencia_hoy(
+    df_lista_empleados, mapa_estado, mapa_hora, cols_por_fila=4,
+    mapa_salida_estado=None, mapa_salida_hora=None, mapa_horas_extra=None,
+):
     """Dibuja la cuadrícula de tarjetas de '¿Quién marcó hoy?' — una
-    tarjeta por trabajador con su nombre, si ya marcó (Puntual/
-    Tardanza) o no (Sin Marcar), y la hora si corresponde. Reutilizable
-    tanto para el resumen general como para cada sede por separado."""
+    tarjeta por trabajador con su nombre, si ya marcó Entrada (Puntual/
+    Tardanza/Sin Marcar) y, si ya marcó Salida también, un segundo
+    renglón con eso: 'Salida Puntual' (verde, salió a su hora oficial
+    o después) o 'Salida Temprano' (ámbar, se fue antes) — más la Hora
+    Extra si la empresa la reconoce (interruptor en Ajustes) y sí
+    trabajó de más ese día."""
+    mapa_salida_estado = mapa_salida_estado or {}
+    mapa_salida_hora = mapa_salida_hora or {}
+    mapa_horas_extra = mapa_horas_extra or {}
+    _permite_hextra = st.session_state.get("permitir_horas_extra", False)
+
     lista = list(df_lista_empleados.sort_values("nombre").iterrows())
     for i in range(0, len(lista), cols_por_fila):
         fila_cols = st.columns(cols_por_fila)
@@ -648,6 +659,36 @@ def render_tarjetas_asistencia_hoy(df_lista_empleados, mapa_estado, mapa_hora, c
             else:
                 color, icono, texto = "#C00000", "⏳", "SIN MARCAR"
             hora = mapa_hora.get(nombre_emp, "")
+
+            # Renglón de Salida (solo si ya marcó) — verde si fue
+            # puntual, ámbar si se fue antes de su hora oficial.
+            salida_html = ""
+            estado_salida = mapa_salida_estado.get(nombre_emp)
+            if estado_salida:
+                hora_salida = mapa_salida_hora.get(nombre_emp, "")
+                min_extra = mapa_horas_extra.get(nombre_emp, 0)
+                if estado_salida == "Puntual":
+                    color_sal, texto_sal = "#00B050", "SALIDA PUNTUAL"
+                else:
+                    color_sal, texto_sal = "#FFAB40", "SALIDA TEMPRANO"
+
+                extra_html = ""
+                if _permite_hextra and min_extra > 0:
+                    extra_html = (
+                        f'<span style="color:#a371f7; font-weight:700;">'
+                        f" · ⏱ +{min_extra} min extra</span>"
+                    )
+
+                salida_html = f"""
+                <div style="font-size:11px; color:{color_sal};
+                    font-weight:700; margin-top:4px;">
+                    🚪 {texto_sal}{extra_html}
+                </div>
+                <div style="font-size:10px; color:#8b949e;">
+                    {hora_salida}
+                </div>
+                """
+
             with fila_cols[j]:
                 render_html(f"""
                 <div style="border:2px solid {color};
@@ -667,6 +708,7 @@ def render_tarjetas_asistencia_hoy(df_lista_empleados, mapa_estado, mapa_hora, c
                         margin-top:2px;">
                         {hora if hora else "&nbsp;"}
                     </div>
+                    {salida_html}
                 </div>
                 """)
 
@@ -6942,46 +6984,48 @@ elif opcion == "🔐 Panel de Gestión / Admin":
 
             st.divider()
 
-            # --- NUEVO: "¿Quién marcó hoy?" — cuadrícula en tiempo real
-            # con TODOS los trabajadores, su check de si ya marcaron y
-            # su estado (Puntual/Tardanza/Sin marcar). Se actualiza
-            # solo, junto con el auto-refresco que ya tiene el
-            # Dashboard. ---
-            st.markdown("### 🟢 ¿Quién marcó hoy?")
+            # Datos de HOY para las tarjetas de cada sede (Entrada +
+            # Salida + Horas Extra, según corresponda) — el bloque
+            # global "¿Quién marcó hoy?" se quitó a pedido tuyo, pero
+            # este cálculo se queda porque cada sede sí lo usa abajo.
             _hoy_str_dash = ahora_peru().strftime("%Y-%m-%d")
-            _asist_hoy = df_asistencia[
-                (df_asistencia["Fecha"].astype(str).str.slice(0, 10) == _hoy_str_dash)
-                & (df_asistencia["Tipo Marcación"] == "Entrada")
+            _asist_hoy_todos = df_asistencia[
+                df_asistencia["Fecha"].astype(str).str.slice(0, 10) == _hoy_str_dash
+            ]
+            _asist_hoy_entrada = _asist_hoy_todos[
+                _asist_hoy_todos["Tipo Marcación"] == "Entrada"
+            ]
+            _asist_hoy_salida = _asist_hoy_todos[
+                _asist_hoy_todos["Tipo Marcación"] == "Salida"
             ]
             _map_estado_hoy = {}
             _map_hora_hoy = {}
-            if not _asist_hoy.empty:
-                for _, _fila_hoy in _asist_hoy.iterrows():
+            if not _asist_hoy_entrada.empty:
+                for _, _fila_hoy in _asist_hoy_entrada.iterrows():
                     _map_estado_hoy[_fila_hoy["Empleado"]] = _fila_hoy["Estado"]
                     _map_hora_hoy[_fila_hoy["Empleado"]] = _fila_hoy.get(
                         "Hora Registrada", ""
                     )
 
-            _total_emp_dash = len(df_empleados)
-            _total_puntual_dash = sum(
-                1 for v in _map_estado_hoy.values() if v == "Puntual"
-            )
-            _total_tardanza_dash = sum(
-                1 for v in _map_estado_hoy.values() if v == "Tardanza"
-            )
-            _total_sin_marcar_dash = _total_emp_dash - len(_map_estado_hoy)
-
-            cq1, cq2, cq3, cq4 = st.columns(4)
-            cq1.metric("👥 Total Personal", _total_emp_dash)
-            cq2.metric("🟢 Puntuales hoy", _total_puntual_dash)
-            cq3.metric("🟠 Con tardanza hoy", _total_tardanza_dash)
-            cq4.metric("🔴 Sin marcar todavía", _total_sin_marcar_dash)
-
-            render_tarjetas_asistencia_hoy(
-                df_empleados, _map_estado_hoy, _map_hora_hoy
-            )
-
-            st.divider()
+            # Salida: "Puntual" si marcó a su hora oficial o después,
+            # "Temprano" si se fue antes de esa hora.
+            _map_salida_estado = {}
+            _map_salida_hora = {}
+            _map_horas_extra_min = {}
+            if not _asist_hoy_salida.empty:
+                for _, _fila_sal in _asist_hoy_salida.iterrows():
+                    _hora_reg_sal = str(_fila_sal.get("Hora Registrada", ""))
+                    _hora_ofic_sal = str(_fila_sal.get("Hora Salida Oficial", ""))
+                    if _hora_reg_sal and _hora_ofic_sal:
+                        _map_salida_estado[_fila_sal["Empleado"]] = (
+                            "Puntual"
+                            if _hora_reg_sal >= _hora_ofic_sal
+                            else "Temprano"
+                        )
+                    _map_salida_hora[_fila_sal["Empleado"]] = _hora_reg_sal
+                    _map_horas_extra_min[_fila_sal["Empleado"]] = int(
+                        _fila_sal.get("Horas Extra (min)", 0) or 0
+                    )
 
             for sede in sedes_unicas:
                 with st.container(border=True):
@@ -6996,7 +7040,10 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         )
                     else:
                         render_tarjetas_asistencia_hoy(
-                            emps_sede, _map_estado_hoy, _map_hora_hoy
+                            emps_sede, _map_estado_hoy, _map_hora_hoy,
+                            mapa_salida_estado=_map_salida_estado,
+                            mapa_salida_hora=_map_salida_hora,
+                            mapa_horas_extra=_map_horas_extra_min,
                         )
                 st.write("")
 
@@ -8807,6 +8854,37 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         " no se guardó nada."
                                     )
 
+                        st.divider()
+                        with st.container(border=True):
+                            st.markdown("#### 🕐 Horas Extra")
+                            toggle_hextra = st.checkbox(
+                                "Esta empresa SÍ reconoce y paga horas extra",
+                                value=st.session_state.permitir_horas_extra,
+                                help=(
+                                    "Si lo dejas destildado, las horas extra"
+                                    " no se calculan ni se pagan en la"
+                                    " planilla, ni se muestran en las"
+                                    " tarjetas del Dashboard, aunque el"
+                                    " trabajador se quede más tiempo"
+                                    " marcado. Lo activan Developer o"
+                                    " SuperAdmin."
+                                ),
+                            )
+                            if toggle_hextra != st.session_state.permitir_horas_extra:
+                                st.session_state.permitir_horas_extra = toggle_hextra
+                                if supabase:
+                                    try:
+                                        guardar_configuracion_sistema(
+                                            supabase,
+                                            st.session_state.empresa_id,
+                                            permitir_horas_extra=toggle_hextra,
+                                        )
+                                    except Exception as e:
+                                        st.warning(
+                                            f"No se pudo guardar: {e}"
+                                        )
+                                st.rerun()
+
             with tab_objs[5]:
                 if not (
                     st.session_state.developer_global
@@ -8827,68 +8905,44 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     " listos para usar en tu planilla."
                 )
 
-                col_toggle1, col_toggle2 = st.columns([1.3, 1])
-                with col_toggle1:
-                    toggle_hextra = st.checkbox(
-                        "🕐 Esta empresa SÍ reconoce y paga horas extra",
-                        value=st.session_state.permitir_horas_extra,
-                        help=(
-                            "Si lo dejas destildado, las horas extra no"
-                            " se calculan ni se pagan en la planilla,"
-                            " aunque el trabajador se quede más tiempo"
-                            " marcado. Algunas empresas no las"
-                            " reconocen."
-                        ),
+                st.caption(
+                    "📌 El interruptor de Horas Extra se movió a Ajustes"
+                    " → Seguridad (lo activan Developer o SuperAdmin)."
+                )
+                opciones_regimen = list(REGIMENES_LABORALES.keys())
+                regimen_sel = st.selectbox(
+                    "📋 Régimen Laboral de esta empresa:",
+                    opciones_regimen,
+                    index=opciones_regimen.index(
+                        st.session_state.regimen_laboral
                     )
-                    if toggle_hextra != st.session_state.permitir_horas_extra:
-                        st.session_state.permitir_horas_extra = toggle_hextra
-                        if supabase:
-                            try:
-                                guardar_configuracion_sistema(
-                                    supabase,
-                                    st.session_state.empresa_id,
-                                    permitir_horas_extra=toggle_hextra,
-                                )
-                            except Exception as e:
-                                st.warning(
-                                    f"No se pudo guardar la preferencia ({e})."
-                                )
-                        st.rerun()
-                with col_toggle2:
-                    opciones_regimen = list(REGIMENES_LABORALES.keys())
-                    regimen_sel = st.selectbox(
-                        "📋 Régimen Laboral de esta empresa:",
-                        opciones_regimen,
-                        index=opciones_regimen.index(
-                            st.session_state.regimen_laboral
-                        )
-                        if st.session_state.regimen_laboral in opciones_regimen
-                        else 0,
-                        format_func=lambda k: REGIMENES_LABORALES[k]["nombre"],
-                        help=(
-                            "Régimen General: 30 días de vacaciones, CTS y"
-                            " gratificación completas. MYPE Microempresa:"
-                            " 15 días de vacaciones, SIN CTS ni"
-                            " gratificación. MYPE Pequeña Empresa: 15 días"
-                            " de vacaciones, CTS y gratificación a la"
-                            " mitad. Debe coincidir con tu inscripción"
-                            " real en REMYPE (Ley 28015 / D.Leg. 1086)."
-                        ),
-                    )
-                    if regimen_sel != st.session_state.regimen_laboral:
-                        st.session_state.regimen_laboral = regimen_sel
-                        if supabase:
-                            try:
-                                guardar_configuracion_sistema(
-                                    supabase,
-                                    st.session_state.empresa_id,
-                                    regimen_laboral=regimen_sel,
-                                )
-                            except Exception as e:
-                                st.warning(
-                                    f"No se pudo guardar la preferencia ({e})."
-                                )
-                        st.rerun()
+                    if st.session_state.regimen_laboral in opciones_regimen
+                    else 0,
+                    format_func=lambda k: REGIMENES_LABORALES[k]["nombre"],
+                    help=(
+                        "Régimen General: 30 días de vacaciones, CTS y"
+                        " gratificación completas. MYPE Microempresa:"
+                        " 15 días de vacaciones, SIN CTS ni"
+                        " gratificación. MYPE Pequeña Empresa: 15 días"
+                        " de vacaciones, CTS y gratificación a la"
+                        " mitad. Debe coincidir con tu inscripción"
+                        " real en REMYPE (Ley 28015 / D.Leg. 1086)."
+                    ),
+                )
+                if regimen_sel != st.session_state.regimen_laboral:
+                    st.session_state.regimen_laboral = regimen_sel
+                    if supabase:
+                        try:
+                            guardar_configuracion_sistema(
+                                supabase,
+                                st.session_state.empresa_id,
+                                regimen_laboral=regimen_sel,
+                            )
+                        except Exception as e:
+                            st.warning(
+                                f"No se pudo guardar la preferencia ({e})."
+                            )
+                    st.rerun()
 
                 with st.container(border=True):
                     col_pl1, col_pl2 = st.columns(2)
