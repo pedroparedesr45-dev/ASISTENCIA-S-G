@@ -6893,22 +6893,65 @@ if opcion == "⏰ Marcar Asistencia":
             # --- RESPALDO: por si el recuadro de arriba se queda en
             # gris/cargando sin pedir el permiso (visto sobre todo en
             # varios equipos Samsung) — no reemplaza la cámara de
-            # arriba, es una alternativa si esa falla. Se quitó a
-            # propósito la opción de "subir foto" (se prestaba a subir
-            # fotos repetidas/antiguas en vez de una tomada en el
-            # momento) — solo queda la cámara alternativa en vivo.
+            # arriba, es una alternativa si esa falla. Solo queda la
+            # cámara alternativa en vivo (sin opción de subir foto).
+            #
+            # IMPORTANTE: el valor que devuelve el componente alternativo
+            # es un "trigger" de un solo uso —Streamlit lo resetea a
+            # None en el siguiente rerun (por ejemplo, apenas se pide el
+            # GPS más abajo)—, así que hay que guardarlo en
+            # session_state en el momento en que llega, o se pierde la
+            # foto justo cuando se necesita para desbloquear el GPS.
+            _dni_actual = str(datos_emp.get("dni", ""))
+            _clave_cache_foto_alt = f"foto_alt_bytes_{_dni_actual}"
+
             if img_file is None:
-                with st.expander(
-                    "📷 ¿La cámara de arriba no responde o se queda"
-                    " cargando? Toca aquí"
-                ):
-                    img_file_alt = capturar_foto_camara_alternativa(
-                        key=f"cam_alt_{datos_emp.get('dni', '')}"
-                    )
-                    if img_file_alt is not None:
-                        img_file = img_file_alt
+                _foto_alt_guardada = st.session_state.get(
+                    _clave_cache_foto_alt
+                )
+                if _foto_alt_guardada is not None:
+                    # Ya se había tomado una foto con la cámara
+                    # alternativa en un rerun anterior: se reusa en vez
+                    # de perderla.
+                    _archivo_cache = io.BytesIO(_foto_alt_guardada)
+                    _archivo_cache.size = len(_foto_alt_guardada)
+                    _archivo_cache.name = "foto_marcacion.jpg"
+                    img_file = _archivo_cache
+                    st.success("📸 Foto tomada con la cámara alternativa.")
+                    if st.button(
+                        "🔄 Tomar otra foto (cámara alternativa)",
+                        key=f"cam_alt_retomar_{_dni_actual}",
+                    ):
+                        st.session_state.pop(_clave_cache_foto_alt, None)
+                        st.rerun()
+                else:
+                    with st.expander(
+                        "📷 ¿La cámara de arriba no responde o se queda"
+                        " cargando? Toca aquí"
+                    ):
+                        img_file_alt = capturar_foto_camara_alternativa(
+                            key=f"cam_alt_{_dni_actual}"
+                        )
+                        if img_file_alt is not None:
+                            # Se guarda de inmediato en session_state
+                            # para que sobreviva al siguiente rerun (el
+                            # que pide el GPS), y se usa ya mismo en
+                            # este rerun para no perder tiempo.
+                            img_file_alt.seek(0)
+                            st.session_state[_clave_cache_foto_alt] = (
+                                img_file_alt.read()
+                            )
+                            img_file_alt.seek(0)
+                            img_file = img_file_alt
 
         foto_ya_tomada = img_file is not None
+
+        if not foto_ya_tomada:
+            # Sin foto todavía (ni de la cámara nativa ni de la
+            # alternativa): se limpia cualquier caché de foto alt.
+            # vieja, para no arrastrar una foto de una marcación
+            # anterior a la siguiente.
+            st.session_state.pop(_clave_cache_foto_alt, None)
 
         if foto_ya_tomada:
             # Se pide UNA sola vez por foto (se guarda en cache en
@@ -7194,6 +7237,12 @@ if opcion == "⏰ Marcar Asistencia":
                         f"¡Marcación de {tipo_marcacion} registrada "
                         "localmente!"
                     )
+
+                # Se limpia la caché de la foto de la cámara alternativa
+                # (si se usó) para que la próxima marcación —por
+                # ejemplo, la Salida después de esta Entrada— pida una
+                # foto nueva en vez de reusar esta.
+                st.session_state.pop(_clave_cache_foto_alt, None)
 
                 # --- Animación de marcación exitosa: sello (100% CSS,
                 # confiable) con su propio sonido de "golpe de sello" —
