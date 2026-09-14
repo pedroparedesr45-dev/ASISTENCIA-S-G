@@ -10,3 +10,4 @@ streamlit-js-eval
 tzdata
 mediapipe
 opencv-python-headless
+streamlit>=1.51.0
