@@ -233,6 +233,179 @@ def detectar_rostro_en_foto(img_file):
         img_file.seek(0)
 
 
+# =====================================================================
+# CÁMARA ALTERNATIVA (Custom Component v2) — respaldo para equipos
+# donde el widget nativo st.camera_input se queda "pidiendo cámara" sin
+# responder nunca (visto de forma repetida en varios Samsung, incluso
+# con los permisos ya concedidos). Pide la cámara con restricciones
+# FLEXIBLES (sin forzar cámara exacta ni resolución exacta), que es
+# justo lo que suele hacer fallar la cámara en esos equipos. Requiere
+# Streamlit >= 1.51.0 (donde se introdujo st.components.v2); en
+# versiones más viejas simplemente no se muestra esta opción y el
+# trabajador sigue teniendo el respaldo de "subir foto" (más abajo).
+# =====================================================================
+_CAMARA_ALT_DISPONIBLE = hasattr(st.components, "v2")
+
+if _CAMARA_ALT_DISPONIBLE:
+    _CAMARA_ALT_HTML = """
+    <div id="camwrap" style="max-width:100%;">
+      <video id="camvideo" autoplay playsinline muted
+             style="width:100%;border-radius:12px;background:#111;display:block;"></video>
+      <canvas id="camcanvas" style="display:none;"></canvas>
+      <div id="camerror" style="color:#ff6b6b;font-size:0.85rem;margin-top:6px;"></div>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button id="btncapturar" type="button"
+                style="flex:1;padding:10px;border-radius:8px;border:none;
+                       background:#22c55e;color:white;font-weight:600;cursor:pointer;">
+          📸 Tomar foto
+        </button>
+        <button id="btnreintentar" type="button" style="display:none;flex:1;padding:10px;
+                border-radius:8px;border:none;background:#3b82f6;color:white;
+                font-weight:600;cursor:pointer;">
+          🔄 Reintentar cámara
+        </button>
+      </div>
+      <img id="camfoto" style="width:100%;border-radius:12px;display:none;margin-top:8px;" />
+      <button id="btnrepetir" type="button" style="display:none;width:100%;padding:10px;
+              margin-top:8px;border-radius:8px;border:1px solid #888;background:transparent;
+              color:inherit;cursor:pointer;">
+        ↩️ Tomar otra foto
+      </button>
+    </div>
+    """
+
+    _CAMARA_ALT_JS = """
+    export default function(component) {
+      const { setTriggerValue, parentElement } = component;
+      const video = parentElement.querySelector('#camvideo');
+      const canvas = parentElement.querySelector('#camcanvas');
+      const errBox = parentElement.querySelector('#camerror');
+      const btnCapturar = parentElement.querySelector('#btncapturar');
+      const btnReintentar = parentElement.querySelector('#btnreintentar');
+      const btnRepetir = parentElement.querySelector('#btnrepetir');
+      const foto = parentElement.querySelector('#camfoto');
+
+      let stream = null;
+
+      async function iniciarCamara() {
+        errBox.textContent = '';
+        btnReintentar.style.display = 'none';
+        video.style.display = 'block';
+        btnCapturar.style.display = 'block';
+        foto.style.display = 'none';
+        btnRepetir.style.display = 'none';
+
+        try {
+          // Constraints deliberadamente flexibles: sin "exact" y sin
+          // resolución forzada. Pedir valores exactos es justo lo que
+          // hace fallar la cámara en varios equipos Samsung de gama
+          // media/baja (error OverconstrainedError silencioso).
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user' },
+            audio: false,
+          });
+          video.srcObject = stream;
+        } catch (e1) {
+          try {
+            // Reintento sin pedir cámara frontal específica, por si el
+            // equipo no soporta bien el constraint facingMode.
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+            video.srcObject = stream;
+          } catch (e2) {
+            errBox.textContent =
+              'No se pudo abrir la cámara (' +
+              (e2.name || e2.message || 'error desconocido') +
+              '). Revisa los permisos de cámara del navegador o usa la' +
+              ' opción de subir foto.';
+            btnCapturar.style.display = 'none';
+            btnReintentar.style.display = 'block';
+          }
+        }
+      }
+
+      function detenerCamara() {
+        if (stream) {
+          stream.getTracks().forEach((t) => t.stop());
+          stream = null;
+        }
+      }
+
+      btnCapturar.onclick = () => {
+        if (!video.videoWidth) return;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        foto.src = dataUrl;
+        foto.style.display = 'block';
+        video.style.display = 'none';
+        btnCapturar.style.display = 'none';
+        btnRepetir.style.display = 'block';
+        detenerCamara();
+        setTriggerValue('foto_b64', dataUrl);
+      };
+
+      btnRepetir.onclick = () => {
+        setTriggerValue('foto_b64', null);
+        iniciarCamara();
+      };
+
+      btnReintentar.onclick = () => {
+        iniciarCamara();
+      };
+
+      iniciarCamara();
+    }
+    """
+
+    _camara_alternativa_component = st.components.v2.component(
+        "camara_alternativa_marcacion",
+        html=_CAMARA_ALT_HTML,
+        js=_CAMARA_ALT_JS,
+    )
+
+
+def capturar_foto_camara_alternativa(key=None):
+    """Widget de cámara alternativo (Custom Component v2) para cuando
+    st.camera_input no responde en el equipo del trabajador. Devuelve un
+    objeto tipo archivo (BytesIO con .size, igual que st.camera_input)
+    listo para usarse con validar_foto_captura/detectar_rostro_en_foto/
+    Image.open, o None si todavía no hay foto tomada.
+
+    Si esta instalación usa una versión de Streamlit anterior a 1.51.0
+    (sin Components v2), devuelve None directamente sin mostrar nada —
+    en ese caso solo queda disponible el respaldo de "subir foto".
+    """
+    if not _CAMARA_ALT_DISPONIBLE:
+        return None
+    try:
+        resultado = _camara_alternativa_component(
+            on_foto_b64_change=lambda: None, key=key
+        )
+    except Exception as _e_cam_alt:
+        logger.warning(
+            f"Cámara alternativa no disponible en este entorno: {_e_cam_alt}"
+        )
+        return None
+
+    foto_b64 = getattr(resultado, "foto_b64", None)
+    if not foto_b64:
+        return None
+    try:
+        _cabecera, datos_b64 = foto_b64.split(",", 1)
+        foto_bytes = base64.b64decode(datos_b64)
+    except Exception:
+        return None
+
+    archivo = io.BytesIO(foto_bytes)
+    archivo.size = len(foto_bytes)
+    archivo.name = "foto_marcacion.jpg"
+    return archivo
+
+
 def enviar_marcacion_supabase(empresa_id, dni, nombre, fecha, hora, tipo, foto_url="", gps=""):
     if not supabase:
         return False
@@ -6716,6 +6889,33 @@ if opcion == "⏰ Marcar Asistencia":
                 " no se detecta una cara, no se podrá confirmar la"
                 " marcación."
             )
+
+            # --- RESPALDOS: por si el recuadro de arriba se queda en
+            # gris/cargando sin pedir el permiso (visto sobre todo en
+            # varios equipos Samsung) — no reemplazan la cámara de
+            # arriba, son una alternativa si esa falla. ---
+            if img_file is None:
+                with st.expander(
+                    "📷 ¿La cámara de arriba no responde o se queda"
+                    " cargando? Toca aquí"
+                ):
+                    img_file_alt = capturar_foto_camara_alternativa(
+                        key=f"cam_alt_{datos_emp.get('dni', '')}"
+                    )
+                    if img_file_alt is not None:
+                        img_file = img_file_alt
+
+                    st.caption(
+                        "Si tampoco funciona lo anterior, sube una foto"
+                        " tomada con la app de Cámara de tu teléfono:"
+                    )
+                    img_file_subido = st.file_uploader(
+                        "Subir foto (respaldo)",
+                        type=["jpg", "jpeg", "png"],
+                        key=f"cam_upload_{datos_emp.get('dni', '')}",
+                    )
+                    if img_file_subido is not None:
+                        img_file = img_file_subido
 
         foto_ya_tomada = img_file is not None
 
