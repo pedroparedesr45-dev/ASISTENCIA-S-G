@@ -6890,10 +6890,13 @@ if opcion == "⏰ Marcar Asistencia":
                 " marcación."
             )
 
-            # --- RESPALDOS: por si el recuadro de arriba se queda en
+            # --- RESPALDO: por si el recuadro de arriba se queda en
             # gris/cargando sin pedir el permiso (visto sobre todo en
-            # varios equipos Samsung) — no reemplazan la cámara de
-            # arriba, son una alternativa si esa falla. ---
+            # varios equipos Samsung) — no reemplaza la cámara de
+            # arriba, es una alternativa si esa falla. Se quitó a
+            # propósito la opción de "subir foto" (se prestaba a subir
+            # fotos repetidas/antiguas en vez de una tomada en el
+            # momento) — solo queda la cámara alternativa en vivo.
             if img_file is None:
                 with st.expander(
                     "📷 ¿La cámara de arriba no responde o se queda"
@@ -6904,18 +6907,6 @@ if opcion == "⏰ Marcar Asistencia":
                     )
                     if img_file_alt is not None:
                         img_file = img_file_alt
-
-                    st.caption(
-                        "Si tampoco funciona lo anterior, sube una foto"
-                        " tomada con la app de Cámara de tu teléfono:"
-                    )
-                    img_file_subido = st.file_uploader(
-                        "Subir foto (respaldo)",
-                        type=["jpg", "jpeg", "png"],
-                        key=f"cam_upload_{datos_emp.get('dni', '')}",
-                    )
-                    if img_file_subido is not None:
-                        img_file = img_file_subido
 
         foto_ya_tomada = img_file is not None
 
