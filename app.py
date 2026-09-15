@@ -1076,12 +1076,39 @@ def render_gate_consentimiento(supabase, datos_emp):
                 fecha_consentimiento = ahora_peru().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
-                datos_consentimiento = {
+                # OJO: antes solo se mandaban empresa_id/dni/consentimiento.
+                # Si el trabajador todavía no existía como fila en la
+                # Supabase de este repositorio (solo estaba en el CSV
+                # local), el upsert creaba una fila nueva sin "nombre" —
+                # y esa columna no admite nulos, así que Supabase
+                # rechazaba el guardado. Se incluyen aquí los datos base
+                # que ya se conocen localmente para que, si hay que crear
+                # la fila, quede completa en vez de a medias.
+                datos_consentimiento = {}
+                for _campo_base in (
+                    "nombre",
+                    "cargo",
+                    "sede_principal",
+                    "fecha_ingreso",
+                ):
+                    _valor_base = (
+                        datos_emp.get(_campo_base)
+                        if hasattr(datos_emp, "get")
+                        else None
+                    )
+                    try:
+                        _valor_es_nulo = pd.isna(_valor_base)
+                    except (TypeError, ValueError):
+                        _valor_es_nulo = _valor_base is None
+                    if not _valor_es_nulo and _valor_base not in (None, ""):
+                        datos_consentimiento[_campo_base] = _valor_base
+
+                datos_consentimiento.update({
                     "empresa_id": st.session_state.empresa_id,
                     "dni": str(datos_emp["dni"]),
                     "consentimiento_aceptado": True,
                     "consentimiento_fecha": fecha_consentimiento,
-                }
+                })
                 if supabase:
                     try:
                         guardar_empleado_supabase(
@@ -1110,6 +1137,25 @@ def render_gate_consentimiento(supabase, datos_emp):
                             )
                         ].index
                         if len(idx_c) > 0:
+                            # FIX: en pandas moderno, si la columna quedó
+                            # con un dtype "estricto" (ej. todo NaN → se
+                            # infiere float64), asignar directo un bool o
+                            # texto con .at[] lanza TypeError en vez de
+                            # convertir sola la columna como antes. Se
+                            # fuerza a "object" primero para que acepte
+                            # cualquier tipo, igual que antes.
+                            for _col_consent in (
+                                "consentimiento_aceptado",
+                                "consentimiento_fecha",
+                            ):
+                                if _col_consent in df_emp_full.columns:
+                                    df_emp_full[_col_consent] = (
+                                        df_emp_full[_col_consent].astype(
+                                            object
+                                        )
+                                    )
+                                else:
+                                    df_emp_full[_col_consent] = None
                             df_emp_full.at[
                                 idx_c[0], "consentimiento_aceptado"
                             ] = True
@@ -8646,6 +8692,26 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 )
                                             ].index
                                             if len(idx_e) > 0:
+                                                # FIX (mismo bug de
+                                                # dtype estricto que en
+                                                # el consentimiento): se
+                                                # fuerzan a "object" las
+                                                # columnas que se van a
+                                                # tocar antes de asignar,
+                                                # para que acepten
+                                                # cualquier tipo de valor.
+                                                for campo in (
+                                                    datos_actualizados.keys()
+                                                ):
+                                                    if (
+                                                        campo
+                                                        in df_emp_full.columns
+                                                    ):
+                                                        df_emp_full[campo] = (
+                                                            df_emp_full[
+                                                                campo
+                                                            ].astype(object)
+                                                        )
                                                 for campo, valor in (
                                                     datos_actualizados.items()
                                                 ):
@@ -9011,6 +9077,15 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         & (df_emp_full["dni"] == dni_h)
                                     ].index
                                     if len(idx_h) > 0:
+                                        if (
+                                            "horario_personalizado"
+                                            in df_emp_full.columns
+                                        ):
+                                            df_emp_full[
+                                                "horario_personalizado"
+                                            ] = df_emp_full[
+                                                "horario_personalizado"
+                                            ].astype(object)
                                         df_emp_full.at[
                                             idx_h[0], "horario_personalizado"
                                         ] = horario_json
