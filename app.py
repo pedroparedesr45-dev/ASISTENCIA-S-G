@@ -2114,6 +2114,12 @@ if "mejoras_activadas_prod" not in st.session_state:
 if "permitir_horas_extra" not in st.session_state:
     st.session_state.permitir_horas_extra = False
 
+if "minutos_break_almuerzo" not in st.session_state:
+    st.session_state.minutos_break_almuerzo = 60
+
+if "contar_tiempo_fuera_horario" not in st.session_state:
+    st.session_state.contar_tiempo_fuera_horario = True
+
 if "regimen_laboral" not in st.session_state:
     st.session_state.regimen_laboral = "GENERAL"
 
@@ -2715,6 +2721,14 @@ def cargar_configuracion_sistema(_supabase, empresa_id):
             st.session_state.permitir_horas_extra = bool(
                 cfg.get("permitir_horas_extra", False)
             )
+            st.session_state.minutos_break_almuerzo = int(
+                cfg.get("minutos_break_almuerzo") or 60
+            )
+            st.session_state.contar_tiempo_fuera_horario = bool(
+                cfg.get("contar_tiempo_fuera_horario", True)
+                if cfg.get("contar_tiempo_fuera_horario") is not None
+                else True
+            )
             st.session_state.regimen_laboral = (
                 cfg.get("regimen_laboral") or "GENERAL"
             )
@@ -2816,12 +2830,62 @@ def guardar_empleado_supabase(supabase, datos_empleado):
     veces" para que apareciera). Limpiando el caché aquí, en el mismo
     lugar donde se guarda, la próxima lectura siempre trae el dato
     fresco de inmediato — sin tener que acordarse de limpiarlo a mano
-    en cada uno de los botones de "Agregar/Editar" que hay en la app."""
+    en cada uno de los botones de "Agregar/Editar" que hay en la app.
+
+    BUG REAL YA CORREGIDO (2): varios puntos del código llaman a esta
+    función con un dict PARCIAL (por ejemplo, al guardar solo el
+    consentimiento o solo el horario personalizado de un trabajador,
+    sin su nombre). Si ese trabajador ya existía como fila en
+    Supabase, un upsert parcial es normal y no pasa nada. Pero si
+    TODAVÍA no existía ahí (por ejemplo, solo estaba en el CSV local),
+    el upsert crea una fila nueva — y como "nombre" es NOT NULL en la
+    tabla, Supabase rechazaba el guardado completo con un error poco
+    claro. Para no tener que acordarse de mandar "nombre" en cada uno
+    de los ~8 lugares del código que guardan datos parciales de un
+    trabajador, se resuelve UNA sola vez aquí: si falta "nombre" y la
+    fila es nueva, se rescata del CSV local antes de guardar."""
     if not supabase:
         raise RuntimeError("El cliente de Supabase no está configurado.")
     datos = dict(datos_empleado)
     datos["empresa_id"] = str(datos["empresa_id"])
     datos["dni"] = str(datos["dni"])
+
+    if not datos.get("nombre"):
+        try:
+            _existe_resp = (
+                supabase.table("empleados")
+                .select("dni")
+                .eq("empresa_id", datos["empresa_id"])
+                .eq("dni", datos["dni"])
+                .limit(1)
+                .execute()
+            )
+            _fila_ya_existe = bool(_existe_resp.data)
+        except Exception:
+            # Si la consulta de verificación falla (ej. sin conexión
+            # momentánea), no se arriesga nada nuevo: se deja pasar el
+            # upsert tal cual como se comportaba antes de este fix.
+            _fila_ya_existe = True
+
+        if not _fila_ya_existe:
+            _nombre_rescatado = None
+            if os.path.exists(CSV_EMPLEADOS):
+                try:
+                    _df_csv_tmp = pd.read_csv(CSV_EMPLEADOS, dtype=str)
+                    _match_csv = _df_csv_tmp[
+                        (_df_csv_tmp["empresa_id"] == datos["empresa_id"])
+                        & (_df_csv_tmp["dni"] == datos["dni"])
+                    ]
+                    if len(_match_csv) > 0 and pd.notna(
+                        _match_csv.iloc[0].get("nombre")
+                    ):
+                        _nombre_rescatado = str(
+                            _match_csv.iloc[0]["nombre"]
+                        ).strip()
+                except Exception:
+                    pass
+            datos["nombre"] = _nombre_rescatado or f"(DNI {datos['dni']})"
+
     supabase.table("empleados").upsert(
         datos, on_conflict="empresa_id,dni"
     ).execute()
@@ -5245,6 +5309,491 @@ def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
         else "17:00:00"
     )
     return h_ent, h_sal
+
+
+def calcular_horas_trabajadas_periodo(
+    df_periodo,
+    descuento_break_min=0,
+    emp_info=None,
+    df_sedes=None,
+    contar_fuera_de_horario=True,
+):
+    """Suma las horas realmente trabajadas (Entrada → Salida, por día)
+    dentro del DataFrame de asistencia dado (ya filtrado por trabajador
+    y por el rango de fechas que se quiera medir). Días con solo
+    Entrada (sin Salida marcada aún) no se cuentan, para no inflar el
+    acumulado con un turno todavía abierto. 'descuento_break_min' se
+    resta de cada día contado (ej. 60 min de almuerzo), sin dejar que
+    un día individual baje de 0.
+
+    'contar_fuera_de_horario' (configurable por la empresa):
+    - True (por defecto): se usa la hora REAL marcada tal cual, así
+      haya llegado antes de su hora o se haya quedado después —
+      comportamiento de siempre.
+    - False: el tiempo se recorta al horario pactado de ESE día (se
+      necesita 'emp_info' y 'df_sedes' para saberlo) — si llegó antes
+      de su hora oficial, ese rato de más no cuenta; si salió después
+      de su hora oficial, tampoco. Si llegó tarde o salió temprano
+      (dentro del horario pactado), eso sí sigue contando normal — el
+      recorte solo afecta el tiempo por FUERA de lo pactado.
+
+    Devuelve (horas, minutos).
+    """
+    if df_periodo is None or df_periodo.empty:
+        return 0, 0
+
+    total_min = 0.0
+    _fechas_col = df_periodo["Fecha"].astype(str).str.slice(0, 10)
+    for _fecha_g in _fechas_col.unique():
+        _grupo = df_periodo[_fechas_col == _fecha_g]
+        _ent_g = _grupo[_grupo["Tipo Marcación"] == "Entrada"]
+        _sal_g = _grupo[_grupo["Tipo Marcación"] == "Salida"]
+        if _ent_g.empty or _sal_g.empty:
+            continue
+        try:
+            _t_ent = datetime.strptime(
+                str(_ent_g.iloc[0].get("Hora Registrada", "")), "%H:%M:%S"
+            )
+            _t_sal = datetime.strptime(
+                str(_sal_g.iloc[0].get("Hora Registrada", "")), "%H:%M:%S"
+            )
+
+            if not contar_fuera_de_horario and emp_info is not None:
+                try:
+                    _f_dia = datetime.strptime(
+                        _fecha_g, "%Y-%m-%d"
+                    ).date()
+                    _h_ofic_ent, _h_ofic_sal = obtener_horario_oficial(
+                        emp_info, df_sedes, _f_dia
+                    )
+                    _t_ofic_ent = datetime.strptime(
+                        str(_h_ofic_ent), "%H:%M:%S"
+                    )
+                    _t_ofic_sal = datetime.strptime(
+                        str(_h_ofic_sal), "%H:%M:%S"
+                    )
+                    # Se recorta al horario pactado: no cuenta lo que
+                    # llegó antes de su hora, ni lo que se quedó
+                    # después de su hora.
+                    _t_ent = max(_t_ent, _t_ofic_ent)
+                    _t_sal = min(_t_sal, _t_ofic_sal)
+                except Exception:
+                    pass
+
+            _delta_min = (_t_sal - _t_ent).total_seconds() / 60
+            if _delta_min < 0:
+                _delta_min += 24 * 60  # turno que cruza la medianoche
+            if 0 < _delta_min < 20 * 60:  # descarta datos corruptos (>20h)
+                _delta_min = max(0.0, _delta_min - descuento_break_min)
+                total_min += _delta_min
+        except Exception:
+            continue
+
+    total_min = int(round(total_min))
+    return total_min // 60, total_min % 60
+
+
+def emp_tiene_break_almuerzo(emp_row):
+    """Resuelve si el trabajador tiene hora de break por almuerzo
+    (True por defecto, incluso para trabajadores antiguos que nunca
+    tuvieron este campo guardado)."""
+    _valor = (
+        emp_row.get("tiene_break_almuerzo", True)
+        if hasattr(emp_row, "get")
+        else True
+    )
+    try:
+        if pd.isna(_valor):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(_valor, str):
+        return _valor.strip().upper() not in ("FALSE", "NO", "0", "")
+    return bool(_valor)
+
+
+def calcular_horas_esperadas_periodo(
+    emp_info,
+    df_sedes,
+    fecha_inicio,
+    fecha_fin,
+    descuento_break_min=0,
+    limitar_a_hoy=False,
+):
+    """Calcula la META de horas pactadas entre 'fecha_inicio' y
+    'fecha_fin' (ambas incluidas), día por día, según SU horario
+    realmente pactado — respeta horario_personalizado si lo tiene
+    (incluyendo qué días son laborables para él en particular), o si
+    no, el horario de su sede y los días laborables generales de la
+    empresa. Los feriados oficiales no suman horas. Se le resta el
+    break de almuerzo a cada día contado, igual que a las horas
+    reales, para comparar manzanas con manzanas.
+
+    Por defecto ('limitar_a_hoy=False') calcula el PERIODO COMPLETO
+    (ej. toda la semana Lunes-Domingo, todo el mes) — esa es la meta
+    fija que se debe completar, no se prorratea según cuántos días ya
+    pasaron. Pasa 'limitar_a_hoy=True' si en algún caso sí se
+    necesitara la versión "lo que tocaba hasta hoy". Devuelve
+    (horas, minutos).
+    """
+    if fecha_inicio > fecha_fin:
+        return 0, 0
+
+    _fecha_fin_real = fecha_fin
+    if limitar_a_hoy:
+        _fecha_fin_real = min(fecha_fin, hoy_peru())
+        if fecha_inicio > _fecha_fin_real:
+            return 0, 0
+
+    try:
+        _h_personal = json.loads(
+            emp_info.get("horario_personalizado", "{}") or "{}"
+        )
+    except Exception:
+        _h_personal = {}
+
+    total_min = 0.0
+    _f = fecha_inicio
+    while _f <= _fecha_fin_real:
+        _f_str = _f.strftime("%Y-%m-%d")
+        _nombre_dia = DIAS_SEMANA_MAP[_f.weekday()]
+
+        if _f_str in FERIADOS_OFICIALES:
+            _f += timedelta(days=1)
+            continue
+
+        if _nombre_dia in _h_personal:
+            _es_laborable = _h_personal[_nombre_dia].get("activo", True)
+        else:
+            _es_laborable = (
+                _nombre_dia in st.session_state.dias_laborables
+            )
+
+        if _es_laborable:
+            _h_ent_str, _h_sal_str = obtener_horario_oficial(
+                emp_info, df_sedes, _f
+            )
+            try:
+                _t_ent = datetime.strptime(str(_h_ent_str), "%H:%M:%S")
+                _t_sal = datetime.strptime(str(_h_sal_str), "%H:%M:%S")
+                _delta_min = (_t_sal - _t_ent).total_seconds() / 60
+                if _delta_min < 0:
+                    _delta_min += 24 * 60
+                if 0 < _delta_min < 20 * 60:
+                    _delta_min = max(0.0, _delta_min - descuento_break_min)
+                    total_min += _delta_min
+            except Exception:
+                pass
+
+        _f += timedelta(days=1)
+
+    total_min = int(round(total_min))
+    return total_min // 60, total_min % 60
+
+
+def calcular_deficit_y_extra_mes(
+    df_periodo_mes,
+    emp_info,
+    df_sedes,
+    fecha_inicio_mes,
+    fecha_fin_mes,
+    descuento_break_min,
+    contar_fuera_de_horario,
+):
+    """Recorre día por día el mes (desde fecha_inicio_mes hasta
+    fecha_fin_mes, sin pasar de 'hoy' — así se va prorrateando en
+    tiempo real conforme pasan los días) y calcula DOS acumulados
+    independientes que NO se compensan entre sí:
+
+    - DÉFICIT: minutos que le faltaron cada día para llegar a su meta
+      de ese día (Faltas cuentan el turno completo, Tardanzas y
+      salidas tempranas cuentan lo que faltó). Un día con déficit no
+      se cancela con otro día donde trabajó de más — es un acumulado
+      de "lo que no se cumplió", que solo sube.
+    - EXTRA: minutos trabajados de más cada día, sin restar los días
+      de déficit — igual, solo sube.
+
+    El interruptor de empresa 'contar_tiempo_fuera_de_horario' cambia
+    qué cuenta como "tiempo real" de cada día, IGUAL que en las
+    etiquetas de Horas, para que los 3 acumulados (Horas, Déficit,
+    Extra) sean siempre consistentes entre sí:
+    - ACTIVADO: el tiempo real de cada día es la hora marcada tal
+      cual (aunque llegó antes o se quedó después). El déficit sale
+      de comparar ese real contra la meta del día; el extra es lo que
+      pasó de esa meta.
+    - DESACTIVADO: el tiempo real de cada día se recorta al horario
+      pactado (no se cuenta lo de antes/después). El déficit ahí ya
+      incluye, sin necesidad de casos aparte, tanto las Faltas (real
+      0) como las Tardanzas y salidas tempranas (real recortado). El
+      extra, en este modo, pasa a mostrar el tiempo real trabajado
+      FUERA del horario pactado (llegadas tempranas + salidas
+      tardías) — el que no cuenta para las Horas, pero que igual es
+      útil ver cuánto fue.
+
+    Devuelve ((h_deficit, m_deficit), (h_extra, m_extra)).
+    """
+    _hoy_limite = hoy_peru()
+    _fecha_fin_real = min(fecha_fin_mes, _hoy_limite)
+    if fecha_inicio_mes > _fecha_fin_real:
+        return (0, 0), (0, 0)
+
+    _fechas_col = (
+        df_periodo_mes["Fecha"].astype(str).str.slice(0, 10)
+        if df_periodo_mes is not None and not df_periodo_mes.empty
+        else pd.Series([], dtype=str)
+    )
+
+    try:
+        _h_personal = json.loads(
+            emp_info.get("horario_personalizado", "{}") or "{}"
+        )
+    except Exception:
+        _h_personal = {}
+
+    total_deficit_min = 0.0
+    total_extra_min = 0.0
+    _f = fecha_inicio_mes
+    while _f <= _fecha_fin_real:
+        _f_str = _f.strftime("%Y-%m-%d")
+        _nombre_dia = DIAS_SEMANA_MAP[_f.weekday()]
+
+        if _f_str in FERIADOS_OFICIALES:
+            _f += timedelta(days=1)
+            continue
+
+        if _nombre_dia in _h_personal:
+            _es_laborable = _h_personal[_nombre_dia].get("activo", True)
+        else:
+            _es_laborable = (
+                _nombre_dia in st.session_state.dias_laborables
+            )
+
+        if not _es_laborable:
+            _f += timedelta(days=1)
+            continue
+
+        # --- Meta del día ---
+        _h_ent_o, _h_sal_o = obtener_horario_oficial(
+            emp_info, df_sedes, _f
+        )
+        try:
+            _t_ent_o = datetime.strptime(str(_h_ent_o), "%H:%M:%S")
+            _t_sal_o = datetime.strptime(str(_h_sal_o), "%H:%M:%S")
+            _meta_min = (_t_sal_o - _t_ent_o).total_seconds() / 60
+            if _meta_min < 0:
+                _meta_min += 24 * 60
+            if not (0 < _meta_min < 20 * 60):
+                _f += timedelta(days=1)
+                continue
+            _meta_min = max(0.0, _meta_min - descuento_break_min)
+        except Exception:
+            _f += timedelta(days=1)
+            continue
+
+        # --- Real del día (según marcación, si existe) ---
+        _grupo_dia = (
+            df_periodo_mes[_fechas_col == _f_str]
+            if not _fechas_col.empty
+            else pd.DataFrame()
+        )
+        _ent_dia = (
+            _grupo_dia[_grupo_dia["Tipo Marcación"] == "Entrada"]
+            if not _grupo_dia.empty
+            else pd.DataFrame()
+        )
+        _sal_dia = (
+            _grupo_dia[_grupo_dia["Tipo Marcación"] == "Salida"]
+            if not _grupo_dia.empty
+            else pd.DataFrame()
+        )
+
+        if _ent_dia.empty or _sal_dia.empty:
+            # Falta (o turno todavía abierto sin Salida): no hay horas
+            # reales que contar ese día -> déficit = la meta completa.
+            total_deficit_min += _meta_min
+            _f += timedelta(days=1)
+            continue
+
+        try:
+            _t_ent = datetime.strptime(
+                str(_ent_dia.iloc[0].get("Hora Registrada", "")),
+                "%H:%M:%S",
+            )
+            _t_sal = datetime.strptime(
+                str(_sal_dia.iloc[0].get("Hora Registrada", "")),
+                "%H:%M:%S",
+            )
+        except Exception:
+            total_deficit_min += _meta_min
+            _f += timedelta(days=1)
+            continue
+
+        if contar_fuera_de_horario:
+            _real_min = (_t_sal - _t_ent).total_seconds() / 60
+            if _real_min < 0:
+                _real_min += 24 * 60
+            if not (0 < _real_min < 20 * 60):
+                _f += timedelta(days=1)
+                continue
+            _real_min = max(0.0, _real_min - descuento_break_min)
+
+            if _real_min < _meta_min:
+                total_deficit_min += _meta_min - _real_min
+            else:
+                total_extra_min += _real_min - _meta_min
+        else:
+            _t_ent_recortado = max(_t_ent, _t_ent_o)
+            _t_sal_recortado = min(_t_sal, _t_sal_o)
+            _real_min = (
+                _t_sal_recortado - _t_ent_recortado
+            ).total_seconds() / 60
+            if _real_min < 0:
+                _real_min = 0.0
+            _real_min = max(0.0, _real_min - descuento_break_min)
+
+            if _real_min < _meta_min:
+                total_deficit_min += _meta_min - _real_min
+
+            # Extra = tiempo trabajado FUERA del horario pactado
+            # (no cuenta para Horas en este modo, pero se muestra
+            # igual como informativo).
+            _antes = max(0.0, (_t_ent_o - _t_ent).total_seconds() / 60)
+            _despues = max(0.0, (_t_sal - _t_sal_o).total_seconds() / 60)
+            if _antes < 20 * 60:
+                total_extra_min += _antes
+            if _despues < 20 * 60:
+                total_extra_min += _despues
+
+        _f += timedelta(days=1)
+
+    total_deficit_min = int(round(total_deficit_min))
+    total_extra_min = int(round(total_extra_min))
+    return (
+        (total_deficit_min // 60, total_deficit_min % 60),
+        (total_extra_min // 60, total_extra_min % 60),
+    )
+
+
+def evaluar_cumplimiento_semanas_mes(
+    df_asist_emp_full,
+    emp_info,
+    df_sedes,
+    anio_sel,
+    mes_num_sel,
+    descuento_break_min,
+):
+    """Para cada semana calendario (Lunes-Domingo) que toca el mes
+    seleccionado, calcula si el trabajador cumplió o no su meta de
+    horas pactadas de esa semana. Devuelve una lista de dicts con:
+    numero (1,2,3...), fecha_inicio, fecha_fin (la porción de esa
+    semana que cae DENTRO de este mes), estado
+    ('cumplida' | 'no_cumplida' | 'en_curso' | 'futura'),
+    horas_reales (h,m), horas_meta (h,m), pct, es_parcial.
+
+    - 'cumplida' / 'no_cumplida': la semana (la parte de ella que cae
+      en este mes) ya terminó -> se compara el total real contra la
+      meta de esos mismos días.
+    - 'en_curso': la semana que contiene 'hoy' -> todavía no se puede
+      decir si la cumplió o no, se muestra su avance parcial.
+    - 'futura': semana que todavía no empieza.
+
+    IMPORTANTE: cuando la primera o la última semana del mes cae a
+    caballo con el mes anterior/siguiente (ej. el mes empieza un
+    martes, o termina un miércoles), tanto la meta como las horas
+    reales se recortan a SOLO los días de esa semana que están DENTRO
+    de este mes — así una semana que se cumplió completa (Lunes a
+    Miércoles, si el mes cerró ahí) sale con el check verde, en vez de
+    comparar contra la semana Lunes-Domingo completa cuando el mes ya
+    no tiene esos días.
+    """
+    _primer_dia_mes = date(anio_sel, mes_num_sel, 1)
+    _ultimo_dia_mes = date(
+        anio_sel, mes_num_sel, calendar.monthrange(anio_sel, mes_num_sel)[1]
+    )
+    _hoy = hoy_peru()
+
+    _inicio_1ra_semana = _primer_dia_mes - timedelta(
+        days=_primer_dia_mes.weekday()
+    )
+
+    _fechas_col = (
+        df_asist_emp_full["Fecha"].astype(str).str.slice(0, 10)
+        if df_asist_emp_full is not None and not df_asist_emp_full.empty
+        else pd.Series([], dtype=str)
+    )
+
+    resultados = []
+    _num_semana = 1
+    _inicio_sem_calendario = _inicio_1ra_semana
+    while _inicio_sem_calendario <= _ultimo_dia_mes:
+        _fin_sem_calendario = _inicio_sem_calendario + timedelta(days=6)
+
+        # Se recorta la semana a la porción que cae DENTRO de este
+        # mes — esto es lo que se muestra y lo que se evalúa.
+        _inicio_sem = max(_inicio_sem_calendario, _primer_dia_mes)
+        _fin_sem = min(_fin_sem_calendario, _ultimo_dia_mes)
+        _es_parcial = (
+            _inicio_sem_calendario < _primer_dia_mes
+            or _fin_sem_calendario > _ultimo_dia_mes
+        )
+
+        if _fin_sem < _hoy:
+            _estado = "cumplida"  # se corrige abajo si no llegó a la meta
+        elif _inicio_sem > _hoy:
+            _estado = "futura"
+        else:
+            _estado = "en_curso"
+
+        if _estado == "futura":
+            resultados.append({
+                "numero": _num_semana,
+                "fecha_inicio": _inicio_sem,
+                "fecha_fin": _fin_sem,
+                "estado": "futura",
+                "horas_reales": (0, 0),
+                "horas_meta": (0, 0),
+                "pct": 0,
+                "es_parcial": _es_parcial,
+            })
+            _num_semana += 1
+            _inicio_sem_calendario += timedelta(days=7)
+            continue
+
+        _df_sem = df_asist_emp_full[
+            (_fechas_col >= _inicio_sem.strftime("%Y-%m-%d"))
+            & (_fechas_col <= min(_fin_sem, _hoy).strftime("%Y-%m-%d"))
+        ]
+        _h_real, _m_real = calcular_horas_trabajadas_periodo(
+            _df_sem, descuento_break_min
+        )
+        _h_meta, _m_meta = calcular_horas_esperadas_periodo(
+            emp_info, df_sedes, _inicio_sem, _fin_sem, descuento_break_min
+        )
+        _min_real = _h_real * 60 + _m_real
+        _min_meta = _h_meta * 60 + _m_meta
+        _pct = (
+            100
+            if _min_meta <= 0
+            else max(0, min(999, round(_min_real / _min_meta * 100)))
+        )
+
+        if _estado == "cumplida" and _min_real < _min_meta:
+            _estado = "no_cumplida"
+
+        resultados.append({
+            "numero": _num_semana,
+            "fecha_inicio": _inicio_sem,
+            "fecha_fin": _fin_sem,
+            "estado": _estado,
+            "horas_reales": (_h_real, _m_real),
+            "horas_meta": (_h_meta, _m_meta),
+            "pct": _pct,
+            "es_parcial": _es_parcial,
+        })
+        _num_semana += 1
+        _inicio_sem_calendario += timedelta(days=7)
+
+    return resultados
 
 
 def calcular_distancia(lat1, lon1, lat2, lon2):
@@ -8268,18 +8817,37 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     )
                                     & (
                                         df_asist_actual["Empleado"]
-                                        == emp_ind_sel
+                                        .astype(str)
+                                        .str.strip()
+                                        == str(emp_ind_sel).strip()
                                     )
                                     & (
                                         df_asist_actual["Fecha"]
                                         .astype(str)
+                                        .str.strip()
                                         .str.startswith(prefix_ind)
                                     )
                                     & _condicion_foto
                                 )
-                                df_editables = df_asist_actual[mask_ed]
-
+                                df_editables = df_asist_actual[mask_ed].copy()
                                 if not df_editables.empty:
+                                    # Se limpian espacios en blanco que
+                                    # puedan haberse colado en estas
+                                    # columnas (causa más probable de
+                                    # que un registro "invisible" para
+                                    # los filtros quede como duplicado
+                                    # fantasma en la Bitácora).
+                                    df_editables["Fecha"] = (
+                                        df_editables["Fecha"]
+                                        .astype(str)
+                                        .str.strip()
+                                    )
+                                    df_editables["Tipo Marcación"] = (
+                                        df_editables["Tipo Marcación"]
+                                        .astype(str)
+                                        .str.strip()
+                                    )
+
                                     fechas_disponibles = sorted(
                                         df_editables["Fecha"].unique()
                                     )
@@ -8295,21 +8863,104 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     # aplicaba lo mismo a ambas de
                                     # golpe, lo cual era un error si
                                     # tenían Estado/minutos distintos).
+                                    #
+                                    # FIX: antes solo se ofrecían los
+                                    # tipos que YA tenían registro ese
+                                    # día — si se borraba la Salida
+                                    # (con el botón de más abajo), esa
+                                    # opción desaparecía del selector y
+                                    # era imposible volver a crearla
+                                    # manualmente. Ahora SIEMPRE se
+                                    # ofrecen ambas; si el tipo elegido
+                                    # no tiene registro todavía, se
+                                    # arma uno "en blanco" con valores
+                                    # sugeridos (la hora oficial de esa
+                                    # marcación), para completarlo a
+                                    # mano y guardarlo como nuevo.
                                     df_dia_edit = df_editables[
                                         df_editables["Fecha"] == f_edit_sel
                                     ]
-                                    tipos_disponibles_dia = list(
-                                        df_dia_edit["Tipo Marcación"].unique()
-                                    )
+                                    tipos_disponibles_dia = ["Entrada", "Salida"]
                                     tipo_a_editar = st.radio(
                                         "¿Cuál marcación de ese día?",
                                         tipos_disponibles_dia,
                                         horizontal=True,
                                     )
-                                    fila_actual_edit = df_dia_edit[
+                                    _fila_existente_edit = df_dia_edit[
                                         df_dia_edit["Tipo Marcación"]
                                         == tipo_a_editar
-                                    ].iloc[0]
+                                    ]
+                                    _existe_registro_edit = (
+                                        not _fila_existente_edit.empty
+                                    )
+                                    if _existe_registro_edit:
+                                        if len(_fila_existente_edit) > 1:
+                                            st.error(
+                                                f"⚠️ Hay"
+                                                f" {len(_fila_existente_edit)}"
+                                                f" registros duplicados de"
+                                                f" {tipo_a_editar} guardados"
+                                                f" para {f_edit_sel} (esto"
+                                                " no debería pasar). Al"
+                                                " guardar con el botón de"
+                                                " abajo se van a "
+                                                "reemplazar TODOS por uno"
+                                                " solo, limpio."
+                                            )
+                                        fila_actual_edit = (
+                                            _fila_existente_edit.iloc[0]
+                                        )
+                                    else:
+                                        st.warning(
+                                            f"⚠️ No existe un registro de"
+                                            f" {tipo_a_editar} para"
+                                            f" {f_edit_sel} — probablemente"
+                                            " se borró o nunca se marcó."
+                                            " Completa los datos de abajo"
+                                            " y guarda para CREARLO."
+                                        )
+                                        try:
+                                            _f_edit_date = datetime.strptime(
+                                                f_edit_sel, "%Y-%m-%d"
+                                            ).date()
+                                            _h_ofic_ent_e, _h_ofic_sal_e = (
+                                                obtener_horario_oficial(
+                                                    emp_info,
+                                                    df_sedes,
+                                                    _f_edit_date,
+                                                )
+                                            )
+                                        except Exception:
+                                            _h_ofic_ent_e, _h_ofic_sal_e = (
+                                                "08:00:00",
+                                                "17:00:00",
+                                            )
+                                        _hora_sugerida_e = (
+                                            _h_ofic_ent_e
+                                            if tipo_a_editar == "Entrada"
+                                            else _h_ofic_sal_e
+                                        )
+                                        _sede_sugerida_default = str(
+                                            emp_info.get(
+                                                "sede_principal", ""
+                                            )
+                                            if hasattr(emp_info, "get")
+                                            else ""
+                                        )
+                                        fila_actual_edit = pd.Series({
+                                            "Hora Registrada": _hora_sugerida_e,
+                                            "Hora Entrada Oficial": _h_ofic_ent_e,
+                                            "Hora Salida Oficial": _h_ofic_sal_e,
+                                            "Estado": "Puntual",
+                                            "Minutos Tardanza": 0,
+                                            "Horas Extra (min)": 0,
+                                            "Sede Detectada": (
+                                                _sede_sugerida_default
+                                            ),
+                                            "Distancia (m)": 0,
+                                            "En Rango": "SÍ",
+                                            "Foto": "",
+                                        })
 
                                     if st.session_state.developer_global:
                                         st.caption(
@@ -8381,9 +9032,11 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 if os.path.exists(
                                                     CSV_ASISTENCIA
                                                 )
-                                                else pd.DataFrame()
+                                                else pd.DataFrame(
+                                                    columns=COLUMNAS_ASISTENCIA
+                                                )
                                             )
-                                            indices = df_asist_fresco[
+                                            _mask_reemplazar = (
                                                 (
                                                     df_asist_fresco[
                                                         "empresa_id"
@@ -8394,47 +9047,318 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 )
                                                 & (
                                                     df_asist_fresco["Empleado"]
-                                                    == emp_ind_sel
+                                                    .astype(str)
+                                                    .str.strip()
+                                                    == str(emp_ind_sel).strip()
                                                 )
                                                 & (
                                                     df_asist_fresco["Fecha"]
-                                                    == f_edit_sel
+                                                    .astype(str)
+                                                    .str.strip()
+                                                    == str(f_edit_sel).strip()
                                                 )
                                                 & (
                                                     df_asist_fresco["Tipo Marcación"]
-                                                    == tipo_a_editar
+                                                    .astype(str)
+                                                    .str.strip()
+                                                    == str(tipo_a_editar).strip()
                                                 )
-                                            ].index
+                                            )
 
-                                            for idx_mod in indices:
-                                                df_asist_fresco.at[
-                                                    idx_mod, "Estado"
-                                                ] = nuevo_est
-                                                df_asist_fresco.at[
-                                                    idx_mod,
-                                                    "Minutos Tardanza",
-                                                ] = nuevos_min_t
-                                                df_asist_fresco.at[
-                                                    idx_mod,
-                                                    "Horas Extra (min)",
-                                                ] = nuevos_min_e
-                                                if nueva_hora_registrada is not None:
-                                                    df_asist_fresco.at[
-                                                        idx_mod,
+                                            # FIX: antes se intentaba
+                                            # "actualizar si existe, crear
+                                            # si no" — pero si por
+                                            # cualquier motivo ya había
+                                            # MÁS DE UN registro guardado
+                                            # de este tipo ese día (un
+                                            # duplicado), solo se
+                                            # actualizaba uno y el resto
+                                            # quedaba huérfano dando
+                                            # justo el problema
+                                            # reportado: el calendario
+                                            # (que muestra 1 solo estado
+                                            # por día) se veía bien, pero
+                                            # la Bitácora (que lista CADA
+                                            # fila tal cual) mostraba los
+                                            # duplicados viejos. Ahora se
+                                            # borran TODOS los que
+                                            # coincidan y se inserta
+                                            # exactamente UNO limpio —
+                                            # así es imposible que vuelva
+                                            # a quedar un duplicado,
+                                            # incluso si ya había alguno
+                                            # de antes.
+                                            df_asist_fresco = df_asist_fresco[
+                                                ~_mask_reemplazar
+                                            ]
+
+                                            _hora_final_nueva = (
+                                                nueva_hora_registrada.strftime(
+                                                    "%H:%M:%S"
+                                                )
+                                                if nueva_hora_registrada
+                                                is not None
+                                                else str(
+                                                    fila_actual_edit.get(
                                                         "Hora Registrada",
-                                                    ] = nueva_hora_registrada.strftime(
-                                                        "%H:%M:%S"
+                                                        "08:00:00",
                                                     )
+                                                )
+                                            )
+                                            _sede_preservada = str(
+                                                fila_actual_edit.get(
+                                                    "Sede Detectada", ""
+                                                )
+                                                or ""
+                                            )
+                                            _nueva_fila = {
+                                                "empresa_id": (
+                                                    st.session_state.empresa_id
+                                                ),
+                                                "Fecha": f_edit_sel,
+                                                "Empleado": emp_ind_sel,
+                                                "Tipo Marcación": (
+                                                    tipo_a_editar
+                                                ),
+                                                "Hora Registrada": (
+                                                    _hora_final_nueva
+                                                ),
+                                                "Hora Entrada Oficial": (
+                                                    fila_actual_edit.get(
+                                                        "Hora Entrada"
+                                                        " Oficial", ""
+                                                    )
+                                                ),
+                                                "Hora Salida Oficial": (
+                                                    fila_actual_edit.get(
+                                                        "Hora Salida"
+                                                        " Oficial", ""
+                                                    )
+                                                ),
+                                                "Estado": nuevo_est,
+                                                "Minutos Tardanza": (
+                                                    nuevos_min_t
+                                                ),
+                                                "Horas Extra (min)": (
+                                                    nuevos_min_e
+                                                ),
+                                                "Sede Detectada": (
+                                                    _sede_preservada
+                                                ),
+                                                "Distancia (m)": (
+                                                    fila_actual_edit.get(
+                                                        "Distancia (m)", 0
+                                                    )
+                                                ),
+                                                "En Rango": (
+                                                    fila_actual_edit.get(
+                                                        "En Rango", "SÍ"
+                                                    )
+                                                ),
+                                                "Foto": (
+                                                    fila_actual_edit.get(
+                                                        "Foto", ""
+                                                    )
+                                                ),
+                                            }
+                                            df_asist_fresco = pd.concat(
+                                                [
+                                                    df_asist_fresco,
+                                                    pd.DataFrame(
+                                                        [_nueva_fila]
+                                                    ),
+                                                ],
+                                                ignore_index=True,
+                                            )
 
                                             df_asist_fresco.to_csv(
                                                 CSV_ASISTENCIA, index=False
                                             )
+
+                                        # FIX CLAVE: la app sincroniza
+                                        # cada pocos segundos desde
+                                        # Supabase (tabla
+                                        # marcaciones_efimeras) hacia el
+                                        # CSV local — si el registro
+                                        # original (ej. la Tardanza de
+                                        # las 14:05) seguía existiendo
+                                        # ALLÁ, la próxima sincronización
+                                        # lo volvía a traer y "resucitaba"
+                                        # el duplicado, sin importar
+                                        # cuántas veces se limpiara el
+                                        # CSV local. Se borra también en
+                                        # Supabase para que no vuelva.
+                                        if supabase:
+                                            try:
+                                                supabase.table(
+                                                    "marcaciones_efimeras"
+                                                ).delete().eq(
+                                                    "empresa_id",
+                                                    str(
+                                                        st.session_state.empresa_id
+                                                    ),
+                                                ).eq(
+                                                    "nombre", emp_ind_sel
+                                                ).eq(
+                                                    "fecha", f_edit_sel
+                                                ).eq(
+                                                    "tipo", tipo_a_editar
+                                                ).execute()
+                                            except Exception as _e_sup_del:
+                                                st.warning(
+                                                    "Se guardó local, pero no"
+                                                    " se pudo limpiar el"
+                                                    " registro original en"
+                                                    f" la nube ({_e_sup_del})."
+                                                    " Podría resucitar en la"
+                                                    " próxima sincronización."
+                                                )
+
                                         st.success(
                                             f"Registro de {tipo_a_editar} del"
-                                            f" día {f_edit_sel} actualizado"
-                                            " con éxito."
+                                            f" día {f_edit_sel} guardado"
+                                            " (limpio, sin duplicados)."
                                         )
                                         st.rerun()
+
+                                    # --- Exclusivo Developer: borrar la
+                                    # marcación en vez de editarla, para
+                                    # que el propio trabajador la vuelva
+                                    # a marcar él mismo (ej. se equivocó
+                                    # de tipo, la foto quedó mal, o
+                                    # simplemente se prefiere que quede
+                                    # el registro real en vez de uno
+                                    # corregido a mano). ---
+                                    if st.session_state.developer_global:
+                                        st.markdown("---")
+                                        st.caption(
+                                            "🧪 Developer: en vez de"
+                                            " corregir esta marcación a"
+                                            " mano, puedes borrarla para"
+                                            f" que {emp_ind_sel} entre a"
+                                            " la app y la marque de"
+                                            " nuevo él mismo (con su"
+                                            " propia foto/GPS reales)."
+                                        )
+                                        _confirmar_borrado = st.checkbox(
+                                            f"Sí, borrar la marcación de"
+                                            f" {tipo_a_editar} del"
+                                            f" {f_edit_sel} de"
+                                            f" {emp_ind_sel}",
+                                            key=(
+                                                "confirmar_borrado_"
+                                                f"{f_edit_sel}_{tipo_a_editar}"
+                                            ),
+                                        )
+                                        if st.button(
+                                            "🗑️ Borrar esta marcación"
+                                            " (para que la vuelva a"
+                                            " marcar)",
+                                            disabled=not _confirmar_borrado,
+                                        ):
+                                            with bloqueo_csv(CSV_ASISTENCIA):
+                                                df_asist_borrar = (
+                                                    pd.read_csv(CSV_ASISTENCIA)
+                                                    if os.path.exists(
+                                                        CSV_ASISTENCIA
+                                                    )
+                                                    else pd.DataFrame()
+                                                )
+                                                _mask_borrar = (
+                                                    (
+                                                        df_asist_borrar[
+                                                            "empresa_id"
+                                                        ].astype(str)
+                                                        == str(
+                                                            st.session_state.empresa_id
+                                                        )
+                                                    )
+                                                    & (
+                                                        df_asist_borrar[
+                                                            "Empleado"
+                                                        ]
+                                                        .astype(str)
+                                                        .str.strip()
+                                                        == str(
+                                                            emp_ind_sel
+                                                        ).strip()
+                                                    )
+                                                    & (
+                                                        df_asist_borrar[
+                                                            "Fecha"
+                                                        ]
+                                                        .astype(str)
+                                                        .str.strip()
+                                                        == str(
+                                                            f_edit_sel
+                                                        ).strip()
+                                                    )
+                                                    & (
+                                                        df_asist_borrar[
+                                                            "Tipo Marcación"
+                                                        ]
+                                                        .astype(str)
+                                                        .str.strip()
+                                                        == str(
+                                                            tipo_a_editar
+                                                        ).strip()
+                                                    )
+                                                )
+                                                df_asist_borrar = (
+                                                    df_asist_borrar[
+                                                        ~_mask_borrar
+                                                    ]
+                                                )
+                                                df_asist_borrar.to_csv(
+                                                    CSV_ASISTENCIA,
+                                                    index=False,
+                                                )
+
+                                            # FIX CLAVE: igual que en
+                                            # "Guardar Ajuste Manual" — si
+                                            # no se borra también en
+                                            # Supabase, la próxima
+                                            # sincronización automática
+                                            # (cada pocos segundos) vuelve
+                                            # a traer este mismo registro
+                                            # desde la nube y "resucita"
+                                            # lo que se acaba de borrar.
+                                            if supabase:
+                                                try:
+                                                    supabase.table(
+                                                        "marcaciones_efimeras"
+                                                    ).delete().eq(
+                                                        "empresa_id",
+                                                        str(
+                                                            st.session_state.empresa_id
+                                                        ),
+                                                    ).eq(
+                                                        "nombre", emp_ind_sel
+                                                    ).eq(
+                                                        "fecha", f_edit_sel
+                                                    ).eq(
+                                                        "tipo", tipo_a_editar
+                                                    ).execute()
+                                                except Exception as _e_sup_del2:
+                                                    st.warning(
+                                                        "Se borró local, pero"
+                                                        " no se pudo borrar"
+                                                        " en la nube"
+                                                        f" ({_e_sup_del2})."
+                                                        " Podría resucitar en"
+                                                        " la próxima"
+                                                        " sincronización."
+                                                    )
+
+                                            st.success(
+                                                f"Marcación de"
+                                                f" {tipo_a_editar} del"
+                                                f" {f_edit_sel} borrada."
+                                                f" {emp_ind_sel} ya puede"
+                                                " volver a marcarla desde"
+                                                " la app."
+                                            )
+                                            st.rerun()
                                 else:
                                     st.caption(
                                         "🔒 No hay registros disponibles"
@@ -8509,6 +9433,326 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         f"{_resumen_extra}"
                     )
 
+                    # --- Etiquetas creativas: horas acumuladas de ESTA
+                    # semana (semana calendario real, lunes a hoy —
+                    # independiente del mes que se esté viendo en el
+                    # filtro) y del MES seleccionado en el filtro de
+                    # arriba, comparadas contra las horas que le TOCABA
+                    # acumular según SU horario pactado día por día
+                    # (respeta horario_personalizado, días laborables
+                    # distintos, y feriados). Son individuales por
+                    # trabajador. Si el trabajador tiene activado el
+                    # break de almuerzo, se le descuenta de ambos
+                    # lados (real y esperado) para comparar parejo.
+                    _hoy_ref_semana = hoy_peru()
+                    _inicio_semana_ref = _hoy_ref_semana - timedelta(
+                        days=_hoy_ref_semana.weekday()
+                    )
+                    _fin_semana_ref = _inicio_semana_ref + timedelta(days=6)
+                    _df_asist_emp_full = df_asistencia[
+                        df_asistencia["Empleado"] == emp_ind_sel
+                    ]
+                    _fechas_emp_full = (
+                        _df_asist_emp_full["Fecha"].astype(str).str.slice(0, 10)
+                    )
+                    _df_semana_actual = _df_asist_emp_full[
+                        (_fechas_emp_full >= _inicio_semana_ref.strftime("%Y-%m-%d"))
+                        & (_fechas_emp_full <= _hoy_ref_semana.strftime("%Y-%m-%d"))
+                    ]
+
+                    _break_activo_emp = emp_tiene_break_almuerzo(emp_info)
+                    _min_break_emp = (
+                        int(st.session_state.get("minutos_break_almuerzo", 60))
+                        if _break_activo_emp
+                        else 0
+                    )
+                    _contar_fuera_horario = bool(
+                        st.session_state.get(
+                            "contar_tiempo_fuera_horario", True
+                        )
+                    )
+
+                    _h_semana, _m_semana = calcular_horas_trabajadas_periodo(
+                        _df_semana_actual,
+                        _min_break_emp,
+                        emp_info=emp_info,
+                        df_sedes=df_sedes,
+                        contar_fuera_de_horario=_contar_fuera_horario,
+                    )
+                    _h_mes, _m_mes = calcular_horas_trabajadas_periodo(
+                        df_asist_emp,
+                        _min_break_emp,
+                        emp_info=emp_info,
+                        df_sedes=df_sedes,
+                        contar_fuera_de_horario=_contar_fuera_horario,
+                    )
+
+                    # Meta = periodo COMPLETO según su horario pactado
+                    # (toda la semana Lun-Dom, todo el mes) — no se
+                    # prorratea a "lo que tocaba hasta hoy", así la
+                    # barra se va llenando hacia esa meta fija a
+                    # medida que van pasando los días laborables.
+                    _h_esp_sem, _m_esp_sem = calcular_horas_esperadas_periodo(
+                        emp_info,
+                        df_sedes,
+                        _inicio_semana_ref,
+                        _fin_semana_ref,
+                        _min_break_emp,
+                    )
+                    _primer_dia_mes_esp = date(anio_ind_sel, m_num, 1)
+                    _ultimo_dia_mes_esp = date(
+                        anio_ind_sel, m_num, num_dias_m
+                    )
+                    _h_esp_mes, _m_esp_mes = calcular_horas_esperadas_periodo(
+                        emp_info,
+                        df_sedes,
+                        _primer_dia_mes_esp,
+                        _ultimo_dia_mes_esp,
+                        _min_break_emp,
+                    )
+
+                    def _pct_cumplido(h_real, m_real, h_esp, m_esp):
+                        _min_real = h_real * 60 + m_real
+                        _min_esp = h_esp * 60 + m_esp
+                        if _min_esp <= 0:
+                            return 100
+                        return max(0, min(100, round(_min_real / _min_esp * 100)))
+
+                    def _color_estado(pct):
+                        if pct >= 100:
+                            return "#00d68f"
+                        if pct >= 70:
+                            return "#ffc93c"
+                        return "#ff6b6b"
+
+                    # --- Déficit y Extra ACUMULADOS DEL MES, prorrateados
+                    # día a día hasta hoy (o hasta fin de mes si se está
+                    # viendo un mes ya cerrado). No se compensan entre
+                    # sí: un día con déficit no se cancela con otro día
+                    # trabajado de más. ---
+                    (
+                        (_h_deficit_mes, _m_deficit_mes),
+                        (_h_extra_mes, _m_extra_mes),
+                    ) = calcular_deficit_y_extra_mes(
+                        df_asist_emp,
+                        emp_info,
+                        df_sedes,
+                        _primer_dia_mes_esp,
+                        _ultimo_dia_mes_esp,
+                        _min_break_emp,
+                        _contar_fuera_horario,
+                    )
+
+                    _pct_sem = _pct_cumplido(
+                        _h_semana, _m_semana, _h_esp_sem, _m_esp_sem
+                    )
+                    _pct_mes = _pct_cumplido(
+                        _h_mes, _m_mes, _h_esp_mes, _m_esp_mes
+                    )
+                    _color_sem = _color_estado(_pct_sem)
+                    _color_mes = _color_estado(_pct_mes)
+                    _break_caption = (
+                        f"🍽️ break de {_min_break_emp} min descontado"
+                        if _break_activo_emp
+                        else "🍽️ sin break descontado"
+                    )
+
+                    render_html(f"""
+                    <div style="display:flex; gap:10px; flex-wrap:wrap;
+                        margin:10px 0 16px 0;">
+                        <div style="flex:1; min-width:220px;
+                            background:linear-gradient(135deg,#1f6feb,#5865f2);
+                            border-radius:14px; padding:14px 16px;
+                            box-shadow:0 4px 14px rgba(88,101,242,0.35);">
+                            <div style="font-size:11px; font-weight:700;
+                                letter-spacing:0.5px; color:#dbe4ff;
+                                text-transform:uppercase;">
+                                📆 Horas esta semana
+                            </div>
+                            <div style="font-size:26px; font-weight:800;
+                                color:#ffffff; margin-top:2px;">
+                                {_h_semana}<span style="font-size:15px;
+                                font-weight:600;">h</span> {_m_semana:02d}<span
+                                style="font-size:15px; font-weight:600;">min</span>
+                                <span style="font-size:14px; font-weight:600;
+                                    color:#dbe4ff;"> / {_h_esp_sem}h
+                                    {_m_esp_sem:02d}min</span>
+                            </div>
+                            <div style="background:rgba(255,255,255,0.25);
+                                border-radius:6px; height:7px; margin-top:8px;
+                                overflow:hidden;">
+                                <div style="width:{_pct_sem}%; height:100%;
+                                    background:{_color_sem}; border-radius:6px;">
+                                </div>
+                            </div>
+                            <div style="font-size:10.5px; color:#c9d4ff;
+                                margin-top:6px;">
+                                Meta: Lun {_inicio_semana_ref.strftime('%d/%m')} a
+                                Dom {_fin_semana_ref.strftime('%d/%m')} ·
+                                {_pct_sem}% cumplido · {_break_caption}
+                            </div>
+                        </div>
+                        <div style="flex:1; min-width:220px;
+                            background:linear-gradient(135deg,#0e9f6e,#0694a2);
+                            border-radius:14px; padding:14px 16px;
+                            box-shadow:0 4px 14px rgba(14,159,110,0.35);">
+                            <div style="font-size:11px; font-weight:700;
+                                letter-spacing:0.5px; color:#d4f7ec;
+                                text-transform:uppercase;">
+                                🗓️ Horas en {mes_ind_sel.lower()}
+                            </div>
+                            <div style="font-size:26px; font-weight:800;
+                                color:#ffffff; margin-top:2px;">
+                                {_h_mes}<span style="font-size:15px;
+                                font-weight:600;">h</span> {_m_mes:02d}<span
+                                style="font-size:15px; font-weight:600;">min</span>
+                                <span style="font-size:14px; font-weight:600;
+                                    color:#d4f7ec;"> / {_h_esp_mes}h
+                                    {_m_esp_mes:02d}min</span>
+                            </div>
+                            <div style="background:rgba(255,255,255,0.25);
+                                border-radius:6px; height:7px; margin-top:8px;
+                                overflow:hidden;">
+                                <div style="width:{_pct_mes}%; height:100%;
+                                    background:{_color_mes}; border-radius:6px;">
+                                </div>
+                            </div>
+                            <div style="font-size:10.5px; color:#d4f7ec;
+                                margin-top:6px;">
+                                Meta del mes completo · {_pct_mes}% cumplido
+                            </div>
+                        </div>
+                    </div>
+                    """)
+
+                    _extra_ayuda = (
+                        "tiempo fuera de su horario, no cuenta en Horas"
+                        if not _contar_fuera_horario
+                        else "trabajado de más sobre la meta de cada día"
+                    )
+                    _deficit_ayuda = (
+                        "faltas + tardanzas + salidas antes de hora"
+                        if not _contar_fuera_horario
+                        else "días donde no llegó a la meta de ese día"
+                    )
+                    render_html(f"""
+                    <div style="display:flex; gap:10px; flex-wrap:wrap;
+                        margin:0 0 16px 0;">
+                        <div style="flex:1; min-width:220px;
+                            background:linear-gradient(135deg,#c02626,#7a1c1c);
+                            border-radius:14px; padding:14px 16px;
+                            box-shadow:0 4px 14px rgba(192,38,38,0.30);">
+                            <div style="font-size:11px; font-weight:700;
+                                letter-spacing:0.5px; color:#ffd9d9;
+                                text-transform:uppercase;">
+                                📉 Minutos No Cumplidos (mes)
+                            </div>
+                            <div style="font-size:26px; font-weight:800;
+                                color:#ffffff; margin-top:2px;">
+                                {_h_deficit_mes}<span style="font-size:15px;
+                                font-weight:600;">h</span> {_m_deficit_mes:02d}<span
+                                style="font-size:15px; font-weight:600;">min</span>
+                            </div>
+                            <div style="font-size:10.5px; color:#ffd9d9;
+                                margin-top:6px;">
+                                Acumulado de {mes_ind_sel.lower()} a la fecha ·
+                                {_deficit_ayuda}
+                            </div>
+                        </div>
+                        <div style="flex:1; min-width:220px;
+                            background:linear-gradient(135deg,#7c3aed,#c026d3);
+                            border-radius:14px; padding:14px 16px;
+                            box-shadow:0 4px 14px rgba(124,58,237,0.30);">
+                            <div style="font-size:11px; font-weight:700;
+                                letter-spacing:0.5px; color:#ecdbff;
+                                text-transform:uppercase;">
+                                ⚡ Minutos Extra Acumulados (mes)
+                            </div>
+                            <div style="font-size:26px; font-weight:800;
+                                color:#ffffff; margin-top:2px;">
+                                {_h_extra_mes}<span style="font-size:15px;
+                                font-weight:600;">h</span> {_m_extra_mes:02d}<span
+                                style="font-size:15px; font-weight:600;">min</span>
+                            </div>
+                            <div style="font-size:10.5px; color:#ecdbff;
+                                margin-top:6px;">
+                                Acumulado de {mes_ind_sel.lower()} a la fecha ·
+                                {_extra_ayuda}
+                            </div>
+                        </div>
+                    </div>
+                    """)
+
+                    # --- Tira compacta: qué semanas del mes cumplieron
+                    # su meta de horas y cuáles no. Una sola línea, con
+                    # detalle exacto en el tooltip (mantener el dedo/
+                    # mouse encima). ---
+                    _semanas_estado = evaluar_cumplimiento_semanas_mes(
+                        df_asist_emp,
+                        emp_info,
+                        df_sedes,
+                        anio_ind_sel,
+                        m_num,
+                        _min_break_emp,
+                    )
+                    _estilo_semana = {
+                        "cumplida": ("#0e9f6e", "✅"),
+                        "no_cumplida": ("#c02626", "❌"),
+                        "en_curso": ("#c9820a", "🔄"),
+                        "futura": ("#3a3f4b", "⚪"),
+                    }
+                    _pildoras_html = ""
+                    for _sem in _semanas_estado:
+                        _color_pill, _icono_pill = _estilo_semana[
+                            _sem["estado"]
+                        ]
+                        _hr, _mr = _sem["horas_reales"]
+                        _he, _me = _sem["horas_meta"]
+                        _sufijo_parcial = (
+                            " (parcial, recortada al mes)"
+                            if _sem.get("es_parcial")
+                            else ""
+                        )
+                        if _sem["estado"] == "futura":
+                            _texto_tooltip = (
+                                f"Semana {_sem['numero']}"
+                                f" ({_sem['fecha_inicio'].strftime('%d/%m')}-"
+                                f"{_sem['fecha_fin'].strftime('%d/%m')}):"
+                                " todavía no empieza"
+                            )
+                        else:
+                            _texto_tooltip = (
+                                f"Semana {_sem['numero']}"
+                                f" ({_sem['fecha_inicio'].strftime('%d/%m')}-"
+                                f"{_sem['fecha_fin'].strftime('%d/%m')})"
+                                f"{_sufijo_parcial}:"
+                                f" {_hr}h{_mr:02d} / {_he}h{_me:02d}"
+                                f" ({_sem['pct']}%)"
+                            )
+                        _pildoras_html += f"""
+                        <div title="{_texto_tooltip}" style="display:flex;
+                            align-items:center; gap:5px;
+                            background:{_color_pill}22; border:1px solid
+                            {_color_pill}; border-radius:20px; padding:4px 10px;
+                            font-size:12px; color:#ffffff; cursor:default;
+                            white-space:nowrap;">
+                            <span>{_icono_pill}</span>
+                            <span style="font-weight:700;">S{_sem['numero']}</span>
+                            {f'<span style="opacity:0.85;">{_sem["pct"]}%</span>' if _sem['estado'] in ('en_curso',) else ''}
+                        </div>
+                        """
+                    render_html(f"""
+                    <div style="display:flex; align-items:center;
+                        gap:8px; flex-wrap:wrap; margin:0 0 16px 0;">
+                        <span style="font-size:11px; font-weight:700;
+                            color:#9aa4b2; text-transform:uppercase;
+                            letter-spacing:0.5px; margin-right:2px;">
+                            📊 Semanas del mes:
+                        </span>
+                        {_pildoras_html}
+                    </div>
+                    """)
+
                     # --- Construcción del calendario, celda por celda ---
                     _primer_dia_mes = date(anio_ind_sel, m_num, 1)
                     _relleno_inicial = _primer_dia_mes.weekday()  # 0=Lunes
@@ -8552,8 +9796,18 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         if not ent_reg.empty:
                             est_dia = ent_reg.iloc[0]["Estado"]
                             _hora_ent_cal = str(ent_reg.iloc[0].get("Hora Registrada", ""))
-                            color_borde = "#00B050" if est_dia == "Puntual" else "#FF8C00"
-                            etiqueta_dia = est_dia.upper()
+                            if sal_reg.empty and f_eval < hoy_peru():
+                                # FIX: hay Entrada pero NO hay Salida
+                                # (ej. se borró para regularizar) y el
+                                # día ya pasó — no es un turno normal
+                                # abierto (eso solo aplica a HOY), así
+                                # que se marca como incompleto en vez
+                                # de mostrar "PUNTUAL" engañosamente.
+                                color_borde = "#FFAB40"
+                                etiqueta_dia = "SIN SALIDA"
+                            else:
+                                color_borde = "#00B050" if est_dia == "Puntual" else "#FF8C00"
+                                etiqueta_dia = est_dia.upper()
                         elif f_eval > hoy_peru():
                             color_borde = "#2d3340"
                             etiqueta_dia = ""
@@ -8621,7 +9875,8 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     """)
 
                     st.caption(
-                        "🟢 Puntual · 🟠 Tardanza · 🔴 Falta · 🔵 Feriado ·"
+                        "🟢 Puntual · 🟠 Tardanza · 🟡 Sin Salida"
+                        " (incompleto) · 🔴 Falta · 🔵 Feriado ·"
                         " ⚪ Descanso (no laborable) · ⬛ Todavía no llega ese día"
                     )
 
@@ -8812,10 +10067,23 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                 val_sed_a = [val_sed_p] if val_sed_p else []
 
                             val_pas = ""  # nunca se muestra el hash guardado
+
+                            _val_break_raw = datos_e.get(
+                                "tiene_break_almuerzo", True
+                            )
+                            try:
+                                val_break = (
+                                    True
+                                    if pd.isna(_val_break_raw)
+                                    else bool(_val_break_raw)
+                                )
+                            except (TypeError, ValueError):
+                                val_break = bool(_val_break_raw)
                         else:
                             val_dni = ""
                             val_nom = ""
                             val_car = ""
+                            val_break = True  # por defecto, activado
                             val_sed_p = sedes_lista[0] if sedes_lista else ""
                             val_sed_a = sedes_lista.copy()
                             val_pas = PASSWORD_EMPLEADO_DEFAULT
@@ -8875,6 +10143,20 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                             type="password",
                         )
 
+                        e_tiene_break = st.checkbox(
+                            "🍽️ Tiene hora de break por almuerzo",
+                            value=val_break,
+                            help=(
+                                "Si está activado, se le descuentan los"
+                                " minutos de break de almuerzo"
+                                " (configurables más abajo, en"
+                                " '🍽️ Break de Almuerzo') del cálculo"
+                                " de horas acumuladas de la semana y"
+                                " del mes. Por defecto viene activado"
+                                " para todos los trabajadores nuevos."
+                            ),
+                        )
+
                         col_btn_e1, col_btn_e2 = st.columns(2)
 
                         with col_btn_e1:
@@ -8902,6 +10184,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             sedes_finales
                                         ),
                                         "fecha_ingreso": e_fecha_ingreso.strip(),
+                                        "tiene_break_almuerzo": e_tiene_break,
                                     }
                                     if e_pass.strip():
                                         # Solo se toca la contraseña si el
@@ -9043,6 +10326,9 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     or hoy_peru().strftime(
                                                         "%Y-%m-%d"
                                                     )
+                                                ),
+                                                "tiene_break_almuerzo": (
+                                                    e_tiene_break
                                                 ),
                                             }
 
@@ -9300,17 +10586,46 @@ elif opcion == "🔐 Panel de Gestión / Admin":
 
                             if supabase:
                                 try:
+                                    # OJO: mismo bug que en el consentimiento
+                                    # — si este trabajador todavía no existía
+                                    # como fila en Supabase (solo local), el
+                                    # upsert creaba una fila nueva sin
+                                    # "nombre" y Supabase la rechazaba. Se
+                                    # incluyen los datos base ya conocidos
+                                    # localmente para que, si hay que crear
+                                    # la fila, quede completa.
+                                    _datos_horario = {}
+                                    for _campo_base in (
+                                        "nombre",
+                                        "cargo",
+                                        "sede_principal",
+                                        "fecha_ingreso",
+                                    ):
+                                        _valor_base = emp_h_row.get(
+                                            _campo_base
+                                        )
+                                        try:
+                                            _es_nulo = pd.isna(_valor_base)
+                                        except (TypeError, ValueError):
+                                            _es_nulo = _valor_base is None
+                                        if (
+                                            not _es_nulo
+                                            and _valor_base not in (None, "")
+                                        ):
+                                            _datos_horario[_campo_base] = (
+                                                _valor_base
+                                            )
+                                    _datos_horario.update({
+                                        "empresa_id": (
+                                            st.session_state.empresa_id
+                                        ),
+                                        "dni": dni_h,
+                                        "horario_personalizado": (
+                                            horario_json
+                                        ),
+                                    })
                                     guardar_empleado_supabase(
-                                        supabase,
-                                        {
-                                            "empresa_id": (
-                                                st.session_state.empresa_id
-                                            ),
-                                            "dni": dni_h,
-                                            "horario_personalizado": (
-                                                horario_json
-                                            ),
-                                        },
+                                        supabase, _datos_horario
                                     )
                                 except Exception as e:
                                     st.warning(
@@ -9966,6 +11281,115 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             supabase,
                                             st.session_state.empresa_id,
                                             permitir_horas_extra=toggle_hextra,
+                                        )
+                                    except Exception as e:
+                                        st.warning(
+                                            f"No se pudo guardar: {e}"
+                                        )
+                                st.rerun()
+
+                        st.divider()
+                        with st.container(border=True):
+                            st.markdown("#### 🍽️ Break de Almuerzo")
+                            st.caption(
+                                "Cuántos minutos de la jornada se"
+                                " descuentan del acumulado de horas"
+                                " trabajadas (etiquetas de 'Horas esta"
+                                " semana' / 'Horas en el mes') para los"
+                                " trabajadores que SÍ tienen hora de"
+                                " break por almuerzo. Ese Sí/No se"
+                                " define individualmente en 'Crear /"
+                                " Editar Trabajador' — por defecto,"
+                                " todos los trabajadores nuevos lo"
+                                " tienen activado."
+                            )
+                            nuevo_min_break = st.number_input(
+                                "Minutos de break por almuerzo:",
+                                min_value=0,
+                                max_value=180,
+                                step=5,
+                                value=int(
+                                    st.session_state.get(
+                                        "minutos_break_almuerzo", 60
+                                    )
+                                ),
+                            )
+                            if nuevo_min_break != st.session_state.get(
+                                "minutos_break_almuerzo", 60
+                            ):
+                                st.session_state.minutos_break_almuerzo = (
+                                    nuevo_min_break
+                                )
+                                if supabase:
+                                    try:
+                                        guardar_configuracion_sistema(
+                                            supabase,
+                                            st.session_state.empresa_id,
+                                            minutos_break_almuerzo=(
+                                                nuevo_min_break
+                                            ),
+                                        )
+                                    except Exception as e:
+                                        st.warning(
+                                            f"No se pudo guardar: {e}"
+                                        )
+                                st.rerun()
+
+                        st.divider()
+                        with st.container(border=True):
+                            st.markdown(
+                                "#### 🎯 Conteo de Horas Fuera del"
+                                " Horario Pactado"
+                            )
+                            st.caption(
+                                "Afecta las etiquetas de 'Horas esta"
+                                " semana' / 'Horas en el mes' de cada"
+                                " trabajador (no las tardanzas ni el"
+                                " sistema de horas extra, que siguen"
+                                " funcionando igual que siempre)."
+                            )
+                            _valor_actual_fuera_horario = bool(
+                                st.session_state.get(
+                                    "contar_tiempo_fuera_horario", True
+                                )
+                            )
+                            toggle_fuera_horario = st.toggle(
+                                "Contar el tiempo tal como se marcó,"
+                                " aunque se salga del horario pactado",
+                                value=_valor_actual_fuera_horario,
+                                help=(
+                                    "✅ ACTIVADO (por defecto): se usa la"
+                                    " hora REAL marcada tal cual — si"
+                                    " llegó antes de su hora o se quedó"
+                                    " después, ese tiempo de más SÍ"
+                                    " cuenta en el acumulado. Si llega"
+                                    " tarde o sale temprano, de todas"
+                                    " formas se cuenta lo que sí"
+                                    " trabajó (eso no depende de este"
+                                    " interruptor).\n\n"
+                                    "⬜ DESACTIVADO: el conteo se recorta"
+                                    " estrictamente al horario pactado"
+                                    " de cada trabajador — el tiempo por"
+                                    " FUERA de su horario (llegadas"
+                                    " tempranas, salidas tardías) NO se"
+                                    " suma al acumulado de horas."
+                                ),
+                            )
+                            if (
+                                toggle_fuera_horario
+                                != _valor_actual_fuera_horario
+                            ):
+                                st.session_state.contar_tiempo_fuera_horario = (
+                                    toggle_fuera_horario
+                                )
+                                if supabase:
+                                    try:
+                                        guardar_configuracion_sistema(
+                                            supabase,
+                                            st.session_state.empresa_id,
+                                            contar_tiempo_fuera_horario=(
+                                                toggle_fuera_horario
+                                            ),
                                         )
                                     except Exception as e:
                                         st.warning(
