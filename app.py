@@ -7903,6 +7903,21 @@ if opcion == "⏰ Marcar Asistencia":
             en_rango = False
             sede_detectada = "Desconocida"
             distancia = 0.0
+            # FIX: 'location' puede venir en 3 estados distintos desde
+            # el navegador, y antes se trataban solo 2 — faltaba
+            # distinguir "todavía no responde" de "respondió pero
+            # falló" (ej. Safari en iPhone bloqueando el permiso
+            # dentro del iframe del componente): None = todavía no
+            # hay respuesta; un dict CON "coords" = ubicación real
+            # obtenida; un dict SIN "coords" = el navegador respondió
+            # pero con un error/permiso denegado, no una ubicación.
+            # Antes, ese tercer caso se contaba como "ubicación
+            # obtenida" para el aviso de abajo (lo cual mostraba
+            # "fuera de rango" aunque nunca se supo dónde estaba la
+            # persona).
+            ubicacion_gps_fallo = bool(location) and "coords" not in (
+                location or {}
+            )
 
             try:
                 sedes_autorizadas = json.loads(
@@ -7937,7 +7952,24 @@ if opcion == "⏰ Marcar Asistencia":
                         f" - Máx: {rango_permitido}m)."
                     )
             else:
-                if foto_ya_tomada:
+                if ubicacion_gps_fallo:
+                    st.error(
+                        "📍 Tu navegador NO pudo darnos tu ubicación GPS"
+                        " (no es que estés fuera de rango — todavía no"
+                        " sabemos dónde estás). En iPhone esto pasa"
+                        " seguido en Safari: ve a Ajustes → Privacidad y"
+                        " Seguridad → Localización → Safari (Apps"
+                        " Websites) y confirma que esté en 'Preguntar' o"
+                        " 'Mientras se usa la app'. Luego toca abajo"
+                        " para volver a intentar."
+                    )
+                    if st.button("🔄 Reintentar obtener mi ubicación"):
+                        st.session_state.ubicacion_marcacion_lista = False
+                        st.session_state.pop(
+                            "ubicacion_marcacion_actual", None
+                        )
+                        st.rerun()
+                elif foto_ya_tomada:
                     st.warning(
                         "📍 Obteniendo ubicación GPS real del navegador..."
                         " Por favor, permite el acceso a tu ubicación si"
@@ -7953,7 +7985,7 @@ if opcion == "⏰ Marcar Asistencia":
         with col2:
             btn_disabled = not en_rango or img_file is None or ya_marcado
 
-            if not en_rango and location:
+            if not en_rango and location and "coords" in location:
                 st.error(
                     "🚫 Bloqueado: No estás dentro del rango de ninguna de tus"
                     " sedes autorizadas."
