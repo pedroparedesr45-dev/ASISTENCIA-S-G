@@ -5290,22 +5290,12 @@ if not VISTA_TRABAJADOR_MOVIL:
                 else:
                     st.error("Supabase no está configurado en esta app.")
 
-        # Indicador de estado del Nivel 1 (detección de rostro). Solo
-        # visible aquí, con el entorno DEV desbloqueado, para que el
-        # developer pueda diagnosticar si falta desplegar el
-        # requirements.txt actualizado sin tener que adivinar.
-        if CV2_DISPONIBLE:
-            st.sidebar.success(
-                "🙂 Nivel 1 (exigir rostro en la foto): ACTIVO",
-                icon="✅",
-            )
-        else:
-            st.sidebar.error(
-                "🙂 Nivel 1 (exigir rostro en la foto): INACTIVO — falta"
-                " 'opencv-python-headless' en requirements.txt de este"
-                " despliegue, o falta redesplegar tras agregarlo.",
-                icon="🚫",
-            )
+        # (Se quitó el indicador de estado del Nivel 1 a pedido tuyo —
+        # ya se advirtió a los trabajadores por fuera que la foto debe
+        # mostrar el rostro. La validación en sí, si algún día vuelve
+        # a funcionar sola con opencv/mediapipe bien instalados, sigue
+        # aplicando igual; esto solo quitó el aviso visual al
+        # developer.)
 elif EMPRESA_URL and not st.session_state.empresa_id:
     # En modo móvil, si la URL trae ?empresa=CODIGO, se precarga.
     st.session_state.empresa_id = EMPRESA_URL
@@ -10548,6 +10538,16 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                             df_empleados["nombre"] == emp_h_sel
                         ].index[0]
                         emp_h_row = df_empleados.loc[emp_h_idx]
+                        # FIX: las claves de los widgets de abajo (chk_/
+                        # ent_/sal_) antes eran las mismas sin importar
+                        # el trabajador (ej. "ent_Lunes") — Streamlit
+                        # "recordaba" el valor entre trabajadores, así
+                        # que al cambiar de persona los campos se
+                        # quedaban con la hora del trabajador ANTERIOR
+                        # en vez de mostrar la suya. Se incluye su DNI
+                        # en cada clave para que cada trabajador tenga
+                        # sus propios widgets, independientes.
+                        _dni_h_sel = str(emp_h_row["dni"])
 
                         try:
                             h_dict_actual = json.loads(
@@ -10606,7 +10606,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         "activo",
                                         dia in st.session_state.dias_laborables,
                                     ),
-                                    key=f"chk_{dia}",
+                                    key=f"chk_{_dni_h_sel}_{dia}",
                                 )
                                 val_ent = h_dict_actual.get(dia, {}).get(
                                     "entrada", _h_ent_sede_default
@@ -10620,14 +10620,14 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                     value=datetime.strptime(
                                         val_ent, "%H:%M:%S"
                                     ).time(),
-                                    key=f"ent_{dia}",
+                                    key=f"ent_{_dni_h_sel}_{dia}",
                                 )
                                 t_sal = st.time_input(
                                     "Salida",
                                     value=datetime.strptime(
                                         val_sal, "%H:%M:%S"
                                     ).time(),
-                                    key=f"sal_{dia}",
+                                    key=f"sal_{_dni_h_sel}_{dia}",
                                 )
 
                                 nuevo_h_dict[dia] = {
