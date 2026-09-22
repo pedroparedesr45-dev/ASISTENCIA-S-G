@@ -2540,7 +2540,25 @@ def sincronizar_marcaciones_nube(supabase, empresa_id):
             else:
                 df_local = pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
 
-            desde = (hoy_peru() - timedelta(days=3)).strftime("%Y-%m-%d")
+            # BUG GRAVE YA CORREGIDO: el CSV local vive en
+            # almacenamiento EFÍMERO — se borra solo cada vez que la
+            # app se reinicia o se redespliega. Antes, pasara lo que
+            # pasara, esta función solo traía de Supabase los últimos
+            # 3 días. Si el CSV se borraba (reinicio) y la última
+            # sincronización había sido hace más de 3 días, TODO el
+            # historial más viejo quedaba invisible en el calendario/
+            # reporte (mostrando "Falta" en días que sí se habían
+            # marcado) — aunque seguía sano y salvo en Supabase, como
+            # prueban las fotos. Ahora, si el CSV local está vacío
+            # (arranque en frío / recién reiniciado), se trae el
+            # HISTORIAL COMPLETO en vez de solo 3 días, para que se
+            # autorepare solo en el próximo reinicio.
+            if df_local.empty:
+                desde = "2000-01-01"
+            else:
+                desde = (hoy_peru() - timedelta(days=3)).strftime(
+                    "%Y-%m-%d"
+                )
             res = (
                 supabase.table("marcaciones_efimeras")
                 .select("*")
