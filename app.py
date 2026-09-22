@@ -2514,7 +2514,7 @@ COLUMNAS_ASISTENCIA = [
 ]
 
 
-def sincronizar_marcaciones_nube(supabase, empresa_id):
+def sincronizar_marcaciones_nube(supabase, empresa_id, forzar_completo=False):
     """Trae desde Supabase las marcaciones de esta empresa de los últimos
     días que aún no estén en el CSV local, y las agrega. Se llama cada vez
     que se carga el panel; combinado con el auto-refresh del panel admin,
@@ -2553,7 +2553,7 @@ def sincronizar_marcaciones_nube(supabase, empresa_id):
             # (arranque en frío / recién reiniciado), se trae el
             # HISTORIAL COMPLETO en vez de solo 3 días, para que se
             # autorepare solo en el próximo reinicio.
-            if df_local.empty:
+            if df_local.empty or forzar_completo:
                 desde = "2000-01-01"
             else:
                 desde = (hoy_peru() - timedelta(days=3)).strftime(
@@ -5251,6 +5251,44 @@ if not VISTA_TRABAJADOR_MOVIL:
                                 )
                 except Exception as e:
                     st.error(f"No se pudo procesar la imagen: {e}")
+
+        with st.sidebar.expander("☁️ Sincronización con la Nube (solo dev)"):
+            st.caption(
+                "El archivo local de asistencia vive en almacenamiento"
+                " EFÍMERO — se borra solo cada vez que la app se"
+                " reinicia o se redespliega. Cuando eso pasa, la app se"
+                " autorepara sola trayendo todo el historial desde"
+                " Supabase la primera vez que alguien entra después del"
+                " reinicio. Si por alguna razón faltan marcaciones"
+                " viejas (aparecen como 'Falta' aunque sí se marcaron),"
+                " usa este botón para forzar la traída de TODO el"
+                " historial ahora mismo, sin esperar a un reinicio."
+            )
+            if st.button("🔄 Forzar sincronización COMPLETA desde Supabase"):
+                if supabase:
+                    with st.spinner(
+                        "Trayendo todo el historial desde Supabase..."
+                    ):
+                        cargar_datos.clear()
+                        _resultado_sync = sincronizar_marcaciones_nube(
+                            supabase,
+                            st.session_state.empresa_id,
+                            forzar_completo=True,
+                        )
+                    if _resultado_sync is not None:
+                        st.success(
+                            f"✅ Listo — {len(_resultado_sync)} registros"
+                            " de asistencia en total tras la"
+                            " sincronización completa."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(
+                            "No se pudo sincronizar (revisa la conexión"
+                            " a Supabase)."
+                        )
+                else:
+                    st.error("Supabase no está configurado en esta app.")
 
         # Indicador de estado del Nivel 1 (detección de rostro). Solo
         # visible aquí, con el entorno DEV desbloqueado, para que el
