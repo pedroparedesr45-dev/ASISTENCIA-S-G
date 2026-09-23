@@ -8990,6 +8990,19 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     f" **Sedes Habilitadas:** {s_aut_str}"
                 )
 
+                # DIAGNÓSTICO TEMPORAL: si el último guardado/borrado en
+                # "Edición Individual" dejó un desglose de tiempos
+                # pendiente de mostrar (se guardó así porque el rerun lo
+                # habría borrado antes de que se pudiera leer), se
+                # muestra acá, bien arriba, apenas se recarga la
+                # página.
+                if st.session_state.get("_diagnostico_tiempos_edicion"):
+                    st.success(
+                        st.session_state.pop(
+                            "_diagnostico_tiempos_edicion"
+                        )
+                    )
+
                 es_autorizado_edicion = (
                     st.session_state.rol in ["admin", "master"]
                     or st.session_state.entorno == "DEV"
@@ -9446,6 +9459,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         )
 
                                     if st.button("💾 Guardar Ajuste Manual"):
+                                        _t0_guardar = _tiempo_monotonico()
                                         with bloqueo_csv(CSV_ASISTENCIA):
                                             df_asist_fresco = (
                                                 pd.read_csv(CSV_ASISTENCIA)
@@ -9595,6 +9609,8 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 CSV_ASISTENCIA, index=False
                                             )
 
+                                        _t1_guardar_local = _tiempo_monotonico()
+
                                         # FIX CLAVE: la app sincroniza
                                         # cada pocos segundos desde
                                         # Supabase (tabla
@@ -9608,6 +9624,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         # cuántas veces se limpiara el
                                         # CSV local. Se borra también en
                                         # Supabase para que no vuelva.
+                                        _sup_ok = True
                                         if supabase:
                                             try:
                                                 with st.spinner(
@@ -9629,6 +9646,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                         "tipo", tipo_a_editar
                                                     ).execute()
                                             except Exception as _e_sup_del:
+                                                _sup_ok = False
                                                 st.warning(
                                                     "Se guardó local, pero no"
                                                     " se pudo limpiar el"
@@ -9638,10 +9656,35 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     " próxima sincronización."
                                                 )
 
-                                        st.success(
+                                        _t2_guardar_supabase = (
+                                            _tiempo_monotonico()
+                                        )
+                                        # DIAGNÓSTICO TEMPORAL: se guarda
+                                        # el desglose de tiempos en
+                                        # session_state (no en un
+                                        # st.success normal, porque el
+                                        # st.rerun() de abajo lo borraría
+                                        # antes de que se alcance a leer)
+                                        # para mostrarlo recién arriba de
+                                        # esta pantalla, ya en el próximo
+                                        # render — así se puede saber
+                                        # EXACTAMENTE qué paso es el
+                                        # lento la próxima vez que se
+                                        # trabe, sin adivinar. Quitar
+                                        # este bloque de diagnóstico una
+                                        # vez identificado el cuello de
+                                        # botella real.
+                                        st.session_state[
+                                            "_diagnostico_tiempos_edicion"
+                                        ] = (
                                             f"Registro de {tipo_a_editar} del"
                                             f" día {f_edit_sel} guardado"
-                                            " (limpio, sin duplicados)."
+                                            " (limpio, sin duplicados). ⏱️"
+                                            " Local:"
+                                            f" {_t1_guardar_local - _t0_guardar:.2f}s"
+                                            " · Supabase:"
+                                            f" {_t2_guardar_supabase - _t1_guardar_local:.2f}s"
+                                            f" {'✅' if _sup_ok else '⚠️'}"
                                         )
                                         st.rerun()
 
@@ -9680,6 +9723,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             " marcar)",
                                             disabled=not _confirmar_borrado,
                                         ):
+                                            _t0_borrar = _tiempo_monotonico()
                                             with bloqueo_csv(CSV_ASISTENCIA):
                                                 df_asist_borrar = (
                                                     pd.read_csv(CSV_ASISTENCIA)
@@ -9738,6 +9782,10 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     index=False,
                                                 )
 
+                                            _t1_borrar_local = (
+                                                _tiempo_monotonico()
+                                            )
+
                                             # FIX CLAVE: igual que en
                                             # "Guardar Ajuste Manual" — si
                                             # no se borra también en
@@ -9747,6 +9795,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             # a traer este mismo registro
                                             # desde la nube y "resucita"
                                             # lo que se acaba de borrar.
+                                            _sup_ok_borrar = True
                                             if supabase:
                                                 try:
                                                     with st.spinner(
@@ -9768,6 +9817,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                             "tipo", tipo_a_editar
                                                         ).execute()
                                                 except Exception as _e_sup_del2:
+                                                    _sup_ok_borrar = False
                                                     st.warning(
                                                         "Se borró local, pero"
                                                         " no se pudo borrar"
@@ -9778,13 +9828,29 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                         " sincronización."
                                                     )
 
-                                            st.success(
+                                            _t2_borrar_supabase = (
+                                                _tiempo_monotonico()
+                                            )
+                                            # DIAGNÓSTICO TEMPORAL: igual
+                                            # que en "Guardar Ajuste
+                                            # Manual" — se guarda en
+                                            # session_state porque el
+                                            # rerun de abajo borraría un
+                                            # st.success normal antes de
+                                            # poder leerlo.
+                                            st.session_state[
+                                                "_diagnostico_tiempos_edicion"
+                                            ] = (
                                                 f"Marcación de"
                                                 f" {tipo_a_editar} del"
                                                 f" {f_edit_sel} borrada."
                                                 f" {emp_ind_sel} ya puede"
                                                 " volver a marcarla desde"
-                                                " la app."
+                                                " la app. ⏱️ Local:"
+                                                f" {_t1_borrar_local - _t0_borrar:.2f}s"
+                                                " · Supabase:"
+                                                f" {_t2_borrar_supabase - _t1_borrar_local:.2f}s"
+                                                f" {'✅' if _sup_ok_borrar else '⚠️'}"
                                             )
                                             st.rerun()
                                 else:
