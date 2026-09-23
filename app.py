@@ -5108,6 +5108,156 @@ def cargar_datos(empresa_id):
     return df_sedes_emp, df_empleados_emp, df_asistencia_emp
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _procesar_auto_marcado_planilla(empresa_id, _df_sedes, _df_empleados):
+    """Para el personal de planilla que no usa el reloj biométrico:
+    si su sede principal tiene '🤖 Auto-marcar asistencia' activado
+    (en Gestión de Sedes), a este proceso le crea SOLO (Entrada +
+    Salida, Puntual) automáticamente para HOY — pero recién 1 minuto
+    DESPUÉS de su hora de salida oficial, nunca antes ni durante su
+    horario, para no adelantarse a un día que todavía no terminó.
+
+    Es idempotente: si el trabajador ya tiene algo marcado hoy (real o
+    auto-marcado antes), no hace nada — así es seguro que se llame
+    varias veces sin crear duplicados.
+
+    Gracias al @st.cache_data(ttl=60), esto se procesa como máximo 1
+    vez por minuto en TODA la empresa (sin importar cuántas personas
+    tengan la app abierta a la vez), la primera vez que alguien la
+    abre después de que pasó ese minuto para cada trabajador — no es
+    un proceso 24/7 independiente de un servidor: si nadie abre la
+    app ese día, no se auto-marca nada hasta que alguien lo haga (el
+    reporte simplemente mostraría 'Falta' hasta ese momento).
+
+    Devuelve cuántos trabajadores se auto-marcaron en esta pasada.
+    """
+    if (
+        _df_sedes is None
+        or _df_sedes.empty
+        or _df_empleados is None
+        or _df_empleados.empty
+        or "auto_marcar_planilla" not in _df_sedes.columns
+    ):
+        return 0
+
+    _sedes_auto = _df_sedes[
+        _df_sedes["auto_marcar_planilla"].fillna(False).astype(bool)
+    ]
+    if _sedes_auto.empty:
+        return 0
+
+    hoy_am = hoy_peru()
+    ahora_am = ahora_peru()
+    hoy_am_str = hoy_am.strftime("%Y-%m-%d")
+    nombre_dia_am = DIAS_SEMANA_MAP[hoy_am.weekday()]
+
+    if hoy_am_str in FERIADOS_OFICIALES:
+        return 0
+
+    df_asist_hoy_am = (
+        pd.read_csv(CSV_ASISTENCIA)
+        if os.path.exists(CSV_ASISTENCIA)
+        else pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
+    )
+
+    nuevos_am = []
+    cant_am = 0
+
+    for _, _sede_row in _sedes_auto.iterrows():
+        _nombre_sede_am = _sede_row.get("nombre_sede", "")
+        _empleados_sede = _df_empleados[
+            _df_empleados["sede_principal"] == _nombre_sede_am
+        ]
+        for _, _emp_am in _empleados_sede.iterrows():
+            try:
+                _h_personal_am = json.loads(
+                    _emp_am.get("horario_personalizado", "{}") or "{}"
+                )
+            except Exception:
+                _h_personal_am = {}
+
+            if nombre_dia_am in _h_personal_am:
+                _es_lab_am = _h_personal_am[nombre_dia_am].get(
+                    "activo", True
+                )
+            else:
+                _es_lab_am = (
+                    nombre_dia_am in st.session_state.dias_laborables
+                )
+            if not _es_lab_am:
+                continue
+
+            h_ent_am, h_sal_am = obtener_horario_oficial(
+                _emp_am, _df_sedes, hoy_am
+            )
+            try:
+                _t_sal_am = datetime.strptime(
+                    str(h_sal_am), "%H:%M:%S"
+                ).time()
+            except Exception:
+                continue
+
+            _limite_am = datetime.combine(
+                hoy_am, _t_sal_am
+            ) + timedelta(minutes=1)
+            if ahora_am < _limite_am:
+                continue  # todavía no pasa 1 min de su hora de salida
+
+            _existe_am = (
+                not df_asist_hoy_am.empty
+                and not df_asist_hoy_am[
+                    (
+                        df_asist_hoy_am["empresa_id"].astype(str)
+                        == str(empresa_id)
+                    )
+                    & (df_asist_hoy_am["Empleado"] == _emp_am["nombre"])
+                    & (df_asist_hoy_am["Fecha"] == hoy_am_str)
+                ].empty
+            )
+            if _existe_am:
+                continue
+
+            for _tipo_am, _hora_am in (
+                ("Entrada", h_ent_am),
+                ("Salida", h_sal_am),
+            ):
+                nuevos_am.append({
+                    "empresa_id": empresa_id,
+                    "Fecha": hoy_am_str,
+                    "Empleado": _emp_am["nombre"],
+                    "Tipo Marcación": _tipo_am,
+                    "Hora Registrada": _hora_am,
+                    "Hora Entrada Oficial": h_ent_am,
+                    "Hora Salida Oficial": h_sal_am,
+                    "Estado": "Puntual",
+                    "Minutos Tardanza": 0,
+                    "Horas Extra (min)": 0,
+                    "Sede Detectada": (
+                        f"{_nombre_sede_am} (auto-marcado planilla)"
+                    ),
+                    "Distancia (m)": 0.0,
+                    "En Rango": "SÍ",
+                    "Foto": "",
+                })
+            cant_am += 1
+
+    if nuevos_am:
+        with bloqueo_csv(CSV_ASISTENCIA):
+            df_asist_hoy_am = (
+                pd.read_csv(CSV_ASISTENCIA)
+                if os.path.exists(CSV_ASISTENCIA)
+                else pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
+            )
+            df_asist_hoy_am = pd.concat(
+                [df_asist_hoy_am, pd.DataFrame(nuevos_am)],
+                ignore_index=True,
+            )
+            df_asist_hoy_am.to_csv(CSV_ASISTENCIA, index=False)
+
+    return cant_am
+
+
+
 # BARRA LATERAL: ENTORNO Y CAMBIO RÁPIDO
 if not VISTA_TRABAJADOR_MOVIL:
     st.sidebar.title("📌 Menú Principal")
@@ -5352,6 +5502,21 @@ df_sedes, df_empleados, df_asistencia = cargar_datos(
     st.session_state.empresa_id
 )
 
+# Auto-marcado de asistencia para personal de planilla (sedes con el
+# interruptor "🤖 Auto-marcar asistencia" activado en Gestión de
+# Sedes) — se revisa como máximo 1 vez por minuto, en CUALQUIER visita
+# a la app (de un trabajador marcando o de un admin viendo el panel),
+# no depende de que alguien entre al Panel de Gestión a propósito.
+if st.session_state.empresa_id:
+    _cant_auto_marcados = _procesar_auto_marcado_planilla(
+        st.session_state.empresa_id, df_sedes, df_empleados
+    )
+    if _cant_auto_marcados:
+        cargar_datos.clear()
+        df_sedes, df_empleados, df_asistencia = cargar_datos(
+            st.session_state.empresa_id
+        )
+
 # Trae la configuración general (logo de las animaciones, horas extra,
 # régimen laboral) para TODOS los flujos — antes solo se cargaba para
 # Admin/Developer, así que un trabajador que solo entraba a marcar
@@ -5372,6 +5537,30 @@ def min_a_formato_horas(minutos_totales):
     hrs = int(minutos_totales // 60)
     mins = int(minutos_totales % 60)
     return f"{hrs}h {mins:02d}m"
+
+
+def _hash_pandas_rapido(obj):
+    """Hash vectorizado (rápido) de un DataFrame/Series, para poder
+    poner @st.cache_data en las funciones de cálculo de horas/déficit/
+    extra/semanas sin tener que reescribir cómo se llaman. Antes esas
+    4 funciones se recalculaban ENTERAS en cada recarga de la página
+    (aunque nada hubiera cambiado desde la última vez) — con ~30 días
+    de horario por calcular, varias veces cada una, eso era una causa
+    real y medible del 'lag' al entrar o navegar en Reporte Limpio por
+    Trabajador. pd.util.hash_pandas_object es la forma rápida oficial
+    de pandas para esto (no recorre fila por fila en Python)."""
+    try:
+        return hash(
+            tuple(pd.util.hash_pandas_object(obj, index=True).values)
+        )
+    except Exception:
+        return hash(str(obj))
+
+
+_CACHE_HASH_FUNCS_PANDAS = {
+    pd.DataFrame: _hash_pandas_rapido,
+    pd.Series: _hash_pandas_rapido,
+}
 
 
 def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
@@ -5404,6 +5593,7 @@ def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
     return h_ent, h_sal
 
 
+@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_horas_trabajadas_periodo(
     df_periodo,
     descuento_break_min=0,
@@ -5505,6 +5695,7 @@ def emp_tiene_break_almuerzo(emp_row):
     return bool(_valor)
 
 
+@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_horas_esperadas_periodo(
     emp_info,
     df_sedes,
@@ -5584,6 +5775,7 @@ def calcular_horas_esperadas_periodo(
     return total_min // 60, total_min % 60
 
 
+@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_deficit_y_extra_mes(
     df_periodo_mes,
     emp_info,
@@ -5603,32 +5795,47 @@ def calcular_deficit_y_extra_mes(
       salidas tempranas cuentan lo que faltó). Un día con déficit no
       se cancela con otro día donde trabajó de más — es un acumulado
       de "lo que no se cumplió", que solo sube.
-    - EXTRA: minutos trabajados de más cada día, sin restar los días
-      de déficit — igual, solo sube.
+    - EXTRA: minutos trabajados DESPUÉS de la hora de salida oficial
+      de cada día (nunca por llegar antes de la entrada) — a pedido
+      tuyo, solo cuenta el tiempo de más al final de la jornada.
 
-    El interruptor de empresa 'contar_tiempo_fuera_de_horario' cambia
-    qué cuenta como "tiempo real" de cada día, IGUAL que en las
-    etiquetas de Horas, para que los 3 acumulados (Horas, Déficit,
-    Extra) sean siempre consistentes entre sí:
-    - ACTIVADO: el tiempo real de cada día es la hora marcada tal
-      cual (aunque llegó antes o se quedó después). El déficit sale
-      de comparar ese real contra la meta del día; el extra es lo que
-      pasó de esa meta.
-    - DESACTIVADO: el tiempo real de cada día se recorta al horario
-      pactado (no se cuenta lo de antes/después). El déficit ahí ya
-      incluye, sin necesidad de casos aparte, tanto las Faltas (real
-      0) como las Tardanzas y salidas tempranas (real recortado). El
-      extra, en este modo, pasa a mostrar el tiempo real trabajado
-      FUERA del horario pactado (llegadas tempranas + salidas
-      tardías) — el que no cuenta para las Horas, pero que igual es
-      útil ver cuánto fue.
+    'HOY' NUNCA SE EVALÚA COMO FALTA A MEDIAS: si el día de hoy está
+    dentro del rango pero su hora de salida oficial todavía no llegó,
+    hoy se excluye del cálculo por completo (se evalúa recién mañana,
+    ya con el día cerrado) — así no se le "debe" injustamente un día
+    que ni siquiera terminó todavía. Si no marcó nada y su turno ya
+    cerró, ahí sí cuenta como Falta.
 
-    Devuelve ((h_deficit, m_deficit), (h_extra, m_extra)).
+    El interruptor de empresa 'contar_tiempo_fuera_de_horario' sigue
+    afectando solo al DÉFICIT (si cuenta o no el tiempo real marcado
+    tal cual vs. recortado al horario pactado) — el Extra ahora usa
+    siempre la misma definición (minutos después de la salida) sin
+    importar el interruptor, para que sea consistente y fácil de
+    entender.
+
+    Devuelve ((h_deficit, m_deficit), (h_extra, m_extra), detalle_extra)
+    donde detalle_extra es una lista de (fecha_str, minutos) para cada
+    día con salida tardía, ordenada de más reciente a más antigua.
     """
     _hoy_limite = hoy_peru()
+    _ahora_dt = ahora_peru()
     _fecha_fin_real = min(fecha_fin_mes, _hoy_limite)
+
+    if _fecha_fin_real == _hoy_limite:
+        try:
+            _h_ent_hoy, _h_sal_hoy = obtener_horario_oficial(
+                emp_info, df_sedes, _hoy_limite
+            )
+            _t_sal_hoy = datetime.strptime(
+                str(_h_sal_hoy), "%H:%M:%S"
+            ).time()
+            if _ahora_dt.time() < _t_sal_hoy:
+                _fecha_fin_real = _hoy_limite - timedelta(days=1)
+        except Exception:
+            pass
+
     if fecha_inicio_mes > _fecha_fin_real:
-        return (0, 0), (0, 0)
+        return (0, 0), (0, 0), []
 
     _fechas_col = (
         df_periodo_mes["Fecha"].astype(str).str.slice(0, 10)
@@ -5645,6 +5852,7 @@ def calcular_deficit_y_extra_mes(
 
     total_deficit_min = 0.0
     total_extra_min = 0.0
+    detalle_extra = []
     _f = fecha_inicio_mes
     while _f <= _fecha_fin_real:
         _f_str = _f.strftime("%Y-%m-%d")
@@ -5732,8 +5940,6 @@ def calcular_deficit_y_extra_mes(
 
             if _real_min < _meta_min:
                 total_deficit_min += _meta_min - _real_min
-            else:
-                total_extra_min += _real_min - _meta_min
         else:
             _t_ent_recortado = max(_t_ent, _t_ent_o)
             _t_sal_recortado = min(_t_sal, _t_sal_o)
@@ -5747,26 +5953,27 @@ def calcular_deficit_y_extra_mes(
             if _real_min < _meta_min:
                 total_deficit_min += _meta_min - _real_min
 
-            # Extra = tiempo trabajado FUERA del horario pactado
-            # (no cuenta para Horas en este modo, pero se muestra
-            # igual como informativo).
-            _antes = max(0.0, (_t_ent_o - _t_ent).total_seconds() / 60)
-            _despues = max(0.0, (_t_sal - _t_sal_o).total_seconds() / 60)
-            if _antes < 20 * 60:
-                total_extra_min += _antes
-            if _despues < 20 * 60:
-                total_extra_min += _despues
+        # Extra = SOLO minutos trabajados después de la hora de salida
+        # oficial — ya no cuenta llegar antes de la entrada, en
+        # ningún modo.
+        _extra_dia = max(0.0, (_t_sal - _t_sal_o).total_seconds() / 60)
+        if 0 < _extra_dia < 20 * 60:
+            total_extra_min += _extra_dia
+            detalle_extra.append((_f_str, round(_extra_dia)))
 
         _f += timedelta(days=1)
 
     total_deficit_min = int(round(total_deficit_min))
     total_extra_min = int(round(total_extra_min))
+    detalle_extra.sort(key=lambda x: x[0], reverse=True)
     return (
         (total_deficit_min // 60, total_deficit_min % 60),
         (total_extra_min // 60, total_extra_min % 60),
+        detalle_extra,
     )
 
 
+@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def evaluar_cumplimiento_semanas_mes(
     df_asist_emp_full,
     emp_info,
@@ -7063,6 +7270,9 @@ def render_modulo_sedes(df_sedes):
                     str(datos_s["hora_salida"]), "%H:%M:%S"
                 ).time()
                 val_s_rango = float(datos_s.get("rango_metros", 100.0))
+                val_s_auto_marcar = bool(
+                    datos_s.get("auto_marcar_planilla", False)
+                )
             else:
                 val_s_nombre = ""
                 val_s_lat = -8.098100
@@ -7070,6 +7280,7 @@ def render_modulo_sedes(df_sedes):
                 val_s_ent = time(8, 0)
                 val_s_sal = time(17, 0)
                 val_s_rango = 100.0
+                val_s_auto_marcar = False
 
             nueva_s_nombre = st.text_input(
                 "Nombre de Sede:",
@@ -7085,6 +7296,23 @@ def render_modulo_sedes(df_sedes):
             nueva_s_ent = st.time_input("Hora Entrada:", value=val_s_ent)
             nueva_s_sal = st.time_input("Hora Salida:", value=val_s_sal)
             nueva_s_rango = st.number_input("Radio Máximo (m):", value=val_s_rango)
+            nueva_s_auto_marcar = st.checkbox(
+                "🤖 Auto-marcar asistencia del personal de esta sede",
+                value=val_s_auto_marcar,
+                help=(
+                    "Para personal en planilla que NO usa el reloj"
+                    " biométrico (foto+GPS): a los trabajadores que"
+                    " tengan esta sede como Sede Principal se les crea"
+                    " automáticamente su Entrada y Salida (Puntual)"
+                    " cada día laborable, recién 1 minuto después de"
+                    " la 'Hora Salida' de esta sede — nunca antes ni"
+                    " durante el horario. Se procesa solo cuando"
+                    " alguien tiene la app abierta (no es un proceso"
+                    " 24/7 aparte); si nadie la abre ese día, se"
+                    " auto-marca en cuanto alguien entre después de esa"
+                    " hora."
+                ),
+            )
 
             col_btn_s1, col_btn_s2 = st.columns(2)
 
@@ -7103,6 +7331,7 @@ def render_modulo_sedes(df_sedes):
                             "hora_entrada": nueva_s_ent.strftime("%H:%M:%S"),
                             "hora_salida": nueva_s_sal.strftime("%H:%M:%S"),
                             "rango_metros": nueva_s_rango,
+                            "auto_marcar_planilla": nueva_s_auto_marcar,
                         }
                         if supabase:
                             try:
@@ -7151,6 +7380,7 @@ def render_modulo_sedes(df_sedes):
                                 "hora_entrada": nueva_s_ent.strftime("%H:%M:%S"),
                                 "hora_salida": nueva_s_sal.strftime("%H:%M:%S"),
                                 "rango_metros": nueva_s_rango,
+                                "auto_marcar_planilla": nueva_s_auto_marcar,
                             }
 
                             if supabase:
@@ -9700,6 +9930,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     (
                         (_h_deficit_mes, _m_deficit_mes),
                         (_h_extra_mes, _m_extra_mes),
+                        _detalle_extra_mes,
                     ) = calcular_deficit_y_extra_mes(
                         df_asist_emp,
                         emp_info,
@@ -9792,11 +10023,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     </div>
                     """)
 
-                    _extra_ayuda = (
-                        "tiempo fuera de su horario, no cuenta en Horas"
-                        if not _contar_fuera_horario
-                        else "trabajado de más sobre la meta de cada día"
-                    )
+                    _extra_ayuda = "minutos trabajados después de su hora de salida"
                     _deficit_ayuda = (
                         "faltas + tardanzas + salidas antes de hora"
                         if not _contar_fuera_horario
@@ -9849,6 +10076,25 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                         </div>
                     </div>
                     """)
+
+                    if _detalle_extra_mes:
+                        with st.expander(
+                            f"📋 Ver el detalle: {len(_detalle_extra_mes)}"
+                            f" día(s) con salida después de hora en"
+                            f" {mes_ind_sel.lower()}"
+                        ):
+                            for _fecha_ex, _min_ex in _detalle_extra_mes:
+                                try:
+                                    _fecha_ex_fmt = datetime.strptime(
+                                        _fecha_ex, "%Y-%m-%d"
+                                    ).strftime("%A %d/%m").capitalize()
+                                except Exception:
+                                    _fecha_ex_fmt = _fecha_ex
+                                st.markdown(
+                                    f"- **{_fecha_ex_fmt}** — se quedó"
+                                    f" {_min_ex} min después de su hora"
+                                    " de salida"
+                                )
 
                     # --- Tira compacta: qué semanas del mes cumplieron
                     # su meta de horas y cuáles no. Una sola línea, con
