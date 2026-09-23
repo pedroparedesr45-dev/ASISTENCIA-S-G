@@ -2573,13 +2573,40 @@ def sincronizar_marcaciones_nube(supabase, empresa_id, forzar_completo=False):
 
             existentes = set()
             if not df_local.empty:
-                for _, r in df_local.iterrows():
-                    existentes.add((
-                        str(r.get("Empleado", "")),
-                        str(r.get("Fecha", "")),
-                        str(r.get("Tipo Marcación", "")),
-                        str(r.get("Hora Registrada", "")),
-                    ))
+                # OPTIMIZACIÓN DE RENDIMIENTO: esto antes usaba
+                # df_local.iterrows(), que en pandas es notoriamente
+                # lento fila por fila — con varios meses de historial
+                # (cientos o miles de filas), y sumado a que esta
+                # función se vuelve a ejecutar cada vez que se guarda
+                # algo en cualquier parte de la app (limpia el caché),
+                # esto era una causa real de la lentitud general y del
+                # "lag" al guardar. Se arma el mismo set de duplicados
+                # con columnas vectorizadas (zip), sin recorrer fila
+                # por fila en Python — igual de correcto, mucho más
+                # rápido.
+                _col_emp = (
+                    df_local["Empleado"].astype(str)
+                    if "Empleado" in df_local.columns
+                    else pd.Series([""] * len(df_local))
+                )
+                _col_fec = (
+                    df_local["Fecha"].astype(str)
+                    if "Fecha" in df_local.columns
+                    else pd.Series([""] * len(df_local))
+                )
+                _col_tipo = (
+                    df_local["Tipo Marcación"].astype(str)
+                    if "Tipo Marcación" in df_local.columns
+                    else pd.Series([""] * len(df_local))
+                )
+                _col_hora = (
+                    df_local["Hora Registrada"].astype(str)
+                    if "Hora Registrada" in df_local.columns
+                    else pd.Series([""] * len(df_local))
+                )
+                existentes = set(
+                    zip(_col_emp, _col_fec, _col_tipo, _col_hora)
+                )
 
             filas_nuevas = []
             for reg in registros_nube:
@@ -2750,8 +2777,25 @@ def cargar_configuracion_sistema(_supabase, empresa_id):
             st.session_state.regimen_laboral = (
                 cfg.get("regimen_laboral") or "GENERAL"
             )
-            if cfg.get("logo_globos_url"):
+            # FIX DE RAÍZ (logo con fondo blanco que volvía solo): antes
+            # se usaba CUALQUIER valor no vacío que hubiera en
+            # logo_globos_url, sin importar cómo llegó ahí — si por un
+            # problema de fila duplicada en Supabase (falta de
+            # restricción única) quedaba guardado el logo viejo, este
+            # código lo volvía a cargar cada vez, deshaciendo el
+            # "Restablecer al logo por defecto" en la siguiente
+            # recarga. Ahora se exige un flag explícito
+            # (logo_personalizado_activo) que solo se pone en True
+            # desde el botón "Usar este logo subido" — así, pase lo
+            # que pase con datos viejos/duplicados en esa columna, se
+            # ignoran por completo a menos que alguien haya subido un
+            # logo a propósito.
+            if cfg.get("logo_globos_url") and cfg.get(
+                "logo_personalizado_activo"
+            ):
                 st.session_state.logo_globos_url = cfg["logo_globos_url"]
+            else:
+                st.session_state.logo_globos_url = LOGO_DEFAULT_EMBEBIDO
             st.session_state.planilla_habilitada = bool(
                 cfg.get("planilla_habilitada", False)
             )
@@ -5165,6 +5209,7 @@ if not VISTA_TRABAJADOR_MOVIL:
                             supabase,
                             st.session_state.empresa_id,
                             logo_globos_url="",
+                            logo_personalizado_activo=False,
                         )
                         st.success(
                             "✅ Restablecido — ya no depende de nada"
@@ -5195,6 +5240,7 @@ if not VISTA_TRABAJADOR_MOVIL:
                             supabase,
                             st.session_state.empresa_id,
                             logo_globos_url=_logo_nuevo,
+                            logo_personalizado_activo=True,
                         )
                         st.success("✅ Logo actualizado para todos.")
                     except Exception as e:
@@ -5238,6 +5284,7 @@ if not VISTA_TRABAJADOR_MOVIL:
                                     supabase,
                                     st.session_state.empresa_id,
                                     logo_globos_url=_data_uri_logo,
+                                    logo_personalizado_activo=True,
                                 )
                                 st.success(
                                     "✅ Logo subido y guardado para todos"
@@ -7564,10 +7611,14 @@ if opcion == "⏰ Marcar Asistencia":
             )
             if empresa_admin_mov:
                 cargar_configuracion_sistema(supabase, empresa_admin_mov)
-            pin_mov = st.text_input(
-                "PIN de Acceso:", type="password", key="pin_admin_movil"
-            )
-            if st.button("Ingresar al Panel", key="btn_login_admin_movil"):
+            with st.form("form_login_admin_movil"):
+                pin_mov = st.text_input(
+                    "PIN de Acceso:", type="password", key="pin_admin_movil"
+                )
+                _submit_admin_mov = st.form_submit_button(
+                    "Ingresar al Panel"
+                )
+            if _submit_admin_mov:
                 if empresa_admin_mov:
                     st.session_state.empresa_id = empresa_admin_mov
                     if clave_coincide(pin_mov, st.session_state.pin_admin):
@@ -7627,12 +7678,22 @@ if opcion == "⏰ Marcar Asistencia":
                 st.info(
                     "No hay empresas configuradas todavía en este entorno."
                 )
-            dni_input = st.text_input("Ingrese su DNI:")
-            pass_input = st.text_input(
-                "Ingrese su Contraseña:", type="password"
-            )
+            # FIX: el Enter no confirmaba el login (ni en celular ni en
+            # PC) porque estos campos no estaban dentro de un
+            # st.form — sin form, Streamlit solo "escucha" el Enter
+            # para widgets sueltos de forma poco confiable. Envueltos
+            # en un formulario, Enter en cualquier campo equivale a
+            # presionar el botón de envío.
+            with st.form("form_login_empleado", clear_on_submit=False):
+                dni_input = st.text_input("Ingrese su DNI:")
+                pass_input = st.text_input(
+                    "Ingrese su Contraseña:", type="password"
+                )
+                _submit_login_emp = st.form_submit_button(
+                    "Ingresar para Marcar"
+                )
 
-            if st.button("Ingresar para Marcar"):
+            if _submit_login_emp:
                 if dni_input and pass_input and empresa_input:
                     emp_code = empresa_input.strip().upper()
                     df_e_val = cargar_empresas()
@@ -7710,18 +7771,22 @@ if opcion == "⏰ Marcar Asistencia":
         st.divider()
 
         with st.expander("🔑 Cambiar mi Contraseña"):
-            pass_actual = st.text_input(
-                "Contraseña actual:", type="password", key="cambio_pass_actual"
-            )
-            pass_nueva = st.text_input(
-                "Nueva contraseña:", type="password", key="cambio_pass_nueva"
-            )
-            pass_nueva_confirmar = st.text_input(
-                "Confirma la nueva contraseña:",
-                type="password",
-                key="cambio_pass_confirmar",
-            )
-            if st.button("Actualizar Contraseña", key="btn_cambiar_pass"):
+            with st.form("form_cambiar_password"):
+                pass_actual = st.text_input(
+                    "Contraseña actual:", type="password", key="cambio_pass_actual"
+                )
+                pass_nueva = st.text_input(
+                    "Nueva contraseña:", type="password", key="cambio_pass_nueva"
+                )
+                pass_nueva_confirmar = st.text_input(
+                    "Confirma la nueva contraseña:",
+                    type="password",
+                    key="cambio_pass_confirmar",
+                )
+                _submit_cambiar_pass = st.form_submit_button(
+                    "Actualizar Contraseña"
+                )
+            if _submit_cambiar_pass:
                 password_vigente_actual = obtener_password_empleado(
                     supabase,
                     st.session_state.empresa_id,
@@ -8302,10 +8367,12 @@ elif opcion == "🔐 Panel de Gestión / Admin":
             )
             if empresa_prod:
                 cargar_configuracion_sistema(supabase, empresa_prod)
-            pin_prod = st.text_input(
-                "PIN de Acceso:", type="password", key="pin_prod_sel"
-            )
-            if st.button("Ingresar", key="btn_ingresar_prod"):
+            with st.form("form_login_prod"):
+                pin_prod = st.text_input(
+                    "PIN de Acceso:", type="password", key="pin_prod_sel"
+                )
+                _submit_login_prod = st.form_submit_button("Ingresar")
+            if _submit_login_prod:
                 st.session_state.empresa_id = empresa_prod
                 st.session_state.developer_global = False
                 if clave_coincide(pin_prod, st.session_state.pin_admin):
@@ -8343,7 +8410,19 @@ elif opcion == "🔐 Panel de Gestión / Admin":
         if "pestana_visible" not in st.session_state:
             st.session_state.pestana_visible = True
         if "admin_intervalo_autorefresh_ms" not in st.session_state:
-            st.session_state.admin_intervalo_autorefresh_ms = 10_000
+            # OPTIMIZACIÓN DE RENDIMIENTO: antes arrancaba en 10_000
+            # (10s) y volvía a 10s cada vez que había una marcación
+            # nueva — en horario de oficina, con gente marcando
+            # seguido, esto lo mantenía recargando la pantalla COMPLETA
+            # (las 7 pestañas, aunque solo se vea una — así funciona
+            # st.tabs en Streamlit) cada 10 segundos, todo el rato. Eso
+            # es la causa más probable del "lag" general: cada
+            # recarga automática competía con lo que el usuario
+            # estuviera haciendo en ese momento (escribiendo,
+            # guardando). Se subió a 20s base / 90s tope — se sigue
+            # sintiendo "casi en tiempo real" para asistencia, pero a
+            # la mitad de frecuencia.
+            st.session_state.admin_intervalo_autorefresh_ms = 20_000
         if "admin_ciclos_sin_cambios" not in st.session_state:
             st.session_state.admin_ciclos_sin_cambios = 0
 
@@ -8359,22 +8438,32 @@ elif opcion == "🔐 Panel de Gestión / Admin":
         )
         if hubo_cambios is True:
             st.session_state.admin_ciclos_sin_cambios = 0
-            st.session_state.admin_intervalo_autorefresh_ms = 10_000
+            st.session_state.admin_intervalo_autorefresh_ms = 20_000
         elif hubo_cambios is False:
             st.session_state.admin_ciclos_sin_cambios += 1
             if st.session_state.admin_ciclos_sin_cambios >= 3:
                 st.session_state.admin_intervalo_autorefresh_ms = min(
                     st.session_state.admin_intervalo_autorefresh_ms * 2,
-                    60_000,
+                    90_000,
                 )
                 st.session_state.admin_ciclos_sin_cambios = 0
 
         if st.session_state.pestana_visible:
             intervalo_ms = st.session_state.admin_intervalo_autorefresh_ms
         else:
-            intervalo_ms = 60_000  # pestaña en segundo plano: casi en pausa
+            intervalo_ms = 90_000  # pestaña en segundo plano: casi en pausa
 
-        st_autorefresh(interval=intervalo_ms, key="admin_autorefresh")
+        # FIX DE RAÍZ: en celular NO se activa el auto-refresh. Es la
+        # causa más probable de los "bugs" reportados ahí (texto
+        # cortado, título encimado con el logo, pantallas que se
+        # quedan a medio cargar) — una recarga automática que llega
+        # justo mientras el celular todavía está pintando la pantalla
+        # anterior la deja a medio terminar. En celular, Admin/Master
+        # ya solo ven Dashboard y Reporte (de solo lectura) — no hay
+        # formularios abiertos que dependan de verse "al segundo", así
+        # que no perder el auto-refresh ahí no quita nada importante.
+        if not ES_CELULAR:
+            st_autorefresh(interval=intervalo_ms, key="admin_autorefresh")
 
         st.title(
             f"⚙️ Control Administrativo - [{st.session_state.empresa_id}]"
