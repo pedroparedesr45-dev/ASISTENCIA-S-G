@@ -5593,7 +5593,6 @@ def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
     return h_ent, h_sal
 
 
-@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_horas_trabajadas_periodo(
     df_periodo,
     descuento_break_min=0,
@@ -5695,7 +5694,6 @@ def emp_tiene_break_almuerzo(emp_row):
     return bool(_valor)
 
 
-@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_horas_esperadas_periodo(
     emp_info,
     df_sedes,
@@ -5775,7 +5773,6 @@ def calcular_horas_esperadas_periodo(
     return total_min // 60, total_min % 60
 
 
-@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def calcular_deficit_y_extra_mes(
     df_periodo_mes,
     emp_info,
@@ -5973,7 +5970,6 @@ def calcular_deficit_y_extra_mes(
     )
 
 
-@st.cache_data(ttl=8, hash_funcs=_CACHE_HASH_FUNCS_PANDAS, show_spinner=False)
 def evaluar_cumplimiento_semanas_mes(
     df_asist_emp_full,
     emp_info,
