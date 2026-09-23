@@ -5816,9 +5816,13 @@ def calcular_deficit_y_extra_mes(
 
     - DÉFICIT: minutos que le faltaron cada día para llegar a su meta
       de ese día (Faltas cuentan el turno completo, Tardanzas y
-      salidas tempranas cuentan lo que faltó). Un día con déficit no
-      se cancela con otro día donde trabajó de más — es un acumulado
-      de "lo que no se cumplió", que solo sube.
+      salidas tempranas cuentan lo que faltó). SIEMPRE se mide contra
+      el horario pactado (recortando entrada/salida a la ventana
+      oficial) — una tardanza nunca se "compensa" quedándose después
+      de su hora; eso es Extra, no anula el Déficit del mismo día. Un
+      día con déficit tampoco se cancela con otro día donde trabajó
+      de más — es un acumulado de "lo que no se cumplió", que solo
+      sube.
     - EXTRA: minutos trabajados DESPUÉS de la hora de salida oficial
       de cada día (nunca por llegar antes de la entrada) — a pedido
       tuyo, solo cuenta el tiempo de más al final de la jornada.
@@ -5830,12 +5834,17 @@ def calcular_deficit_y_extra_mes(
     que ni siquiera terminó todavía. Si no marcó nada y su turno ya
     cerró, ahí sí cuenta como Falta.
 
-    El interruptor de empresa 'contar_tiempo_fuera_de_horario' sigue
-    afectando solo al DÉFICIT (si cuenta o no el tiempo real marcado
-    tal cual vs. recortado al horario pactado) — el Extra ahora usa
-    siempre la misma definición (minutos después de la salida) sin
-    importar el interruptor, para que sea consistente y fácil de
-    entender.
+    BUG REAL YA CORREGIDO: antes, con el interruptor de empresa
+    'contar_tiempo_fuera_de_horario' activado, el Déficit se calculaba
+    con la duración TOTAL del turno (entrada a salida) en vez de con
+    la puntualidad — si alguien llegaba tarde pero se quedaba después
+    para compensar, el turno completo podía igualar o superar la meta
+    y la tardanza desaparecía del cálculo. El interruptor ya NO afecta
+    esta función — el Déficit siempre mide adherencia real al
+    horario; ese interruptor solo debe afectar si esas horas de más
+    cuentan para el total de "Horas trabajadas" (en
+    calcular_horas_trabajadas_periodo, una función aparte), no si
+    hubo o no una tardanza.
 
     Devuelve ((h_deficit, m_deficit), (h_extra, m_extra), detalle_extra)
     donde detalle_extra es una lista de (fecha_str, minutos) para cada
@@ -5953,29 +5962,29 @@ def calcular_deficit_y_extra_mes(
             _f += timedelta(days=1)
             continue
 
-        if contar_fuera_de_horario:
-            _real_min = (_t_sal - _t_ent).total_seconds() / 60
-            if _real_min < 0:
-                _real_min += 24 * 60
-            if not (0 < _real_min < 20 * 60):
-                _f += timedelta(days=1)
-                continue
-            _real_min = max(0.0, _real_min - descuento_break_min)
+        # DÉFICIT: SIEMPRE se mide contra el horario pactado, recortando
+        # la entrada y la salida a la ventana oficial — así una
+        # tardanza NUNCA se "compensa" quedándose después de su hora
+        # (eso solo afecta las Horas/Extra, que se calculan aparte). El
+        # interruptor 'contar_tiempo_fuera_horario' ya NO cambia esta
+        # cuenta: antes, con el interruptor activado, se comparaba la
+        # duración TOTAL del turno (entrada a salida) contra la meta
+        # — si alguien llegaba tarde pero se quedaba tarde también, el
+        # turno completo podía igualar o superar la meta y la tardanza
+        # desaparecía del cálculo. Eso ya no pasa.
+        _t_ent_recortado = max(_t_ent, _t_ent_o)
+        _t_sal_recortado = min(_t_sal, _t_sal_o)
+        _real_min_deficit = (
+            _t_sal_recortado - _t_ent_recortado
+        ).total_seconds() / 60
+        if _real_min_deficit < 0:
+            _real_min_deficit = 0.0
+        _real_min_deficit = max(
+            0.0, _real_min_deficit - descuento_break_min
+        )
 
-            if _real_min < _meta_min:
-                total_deficit_min += _meta_min - _real_min
-        else:
-            _t_ent_recortado = max(_t_ent, _t_ent_o)
-            _t_sal_recortado = min(_t_sal, _t_sal_o)
-            _real_min = (
-                _t_sal_recortado - _t_ent_recortado
-            ).total_seconds() / 60
-            if _real_min < 0:
-                _real_min = 0.0
-            _real_min = max(0.0, _real_min - descuento_break_min)
-
-            if _real_min < _meta_min:
-                total_deficit_min += _meta_min - _real_min
+        if _real_min_deficit < _meta_min:
+            total_deficit_min += _meta_min - _real_min_deficit
 
         # Extra = SOLO minutos trabajados después de la hora de salida
         # oficial — ya no cuenta llegar antes de la entrada, en
@@ -10121,11 +10130,7 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     """)
 
                     _extra_ayuda = "minutos trabajados después de su hora de salida"
-                    _deficit_ayuda = (
-                        "faltas + tardanzas + salidas antes de hora"
-                        if not _contar_fuera_horario
-                        else "días donde no llegó a la meta de ese día"
-                    )
+                    _deficit_ayuda = "faltas + tardanzas + salidas antes de hora"
                     render_html(f"""
                     <div style="display:flex; gap:10px; flex-wrap:wrap;
                         margin:0 0 16px 0;">
