@@ -2529,47 +2529,74 @@ def sincronizar_marcaciones_nube(supabase, empresa_id, forzar_completo=False):
     Optimización: cuando hay filas nuevas, se agregan al final del archivo
     (modo 'append') en vez de reescribir el CSV completo — con meses de
     historial esto es mucho más rápido y mantiene el bloqueo del archivo
-    ocupado por menos tiempo."""
+    ocupado por menos tiempo.
+
+    BUG GRAVE YA CORREGIDO (causa real del 'se pone lento/se congela de
+    la nada' con varias personas usando la app a la vez): la llamada de
+    red a Supabase (.execute()) estaba hecha DENTRO del bloqueo
+    exclusivo del archivo local. El bloqueo es a nivel de todo el
+    servidor — así que mientras UNA sesión esperaba la respuesta de
+    Supabase (puede tardar 1-3+ segundos, a veces más), CUALQUIER OTRA
+    sesión que necesitara ese mismo archivo (otra persona marcando,
+    otro admin viendo el reporte) se quedaba esperando en fila SIN
+    PODER HACER NADA, hasta 15 segundos. Con más gente usando la app a
+    la vez, esas esperas se acumulan una detrás de otra — coincide
+    exactamente con que "empeoró con dos laptops". Ahora la llamada de
+    red va SIN el bloqueo (no le hace daño a nadie mientras espera), y
+    el bloqueo solo protege la lectura+escritura del archivo local, que
+    es rápida y no depende de la red."""
     if not supabase:
         return None
     try:
+        # 1) Se decide desde cuándo pedir datos mirando el archivo
+        # SIN bloqueo (una lectura suelta acá no arriesga nada, ya que
+        # no se va a escribir en este mismo paso).
+        existe_archivo = os.path.exists(CSV_ASISTENCIA)
+        if existe_archivo:
+            df_local_previo = pd.read_csv(CSV_ASISTENCIA)
+        else:
+            df_local_previo = pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
+
+        # BUG GRAVE YA CORREGIDO: el CSV local vive en almacenamiento
+        # EFÍMERO — se borra solo cada vez que la app se reinicia o se
+        # redespliega. Antes, pasara lo que pasara, esta función solo
+        # traía de Supabase los últimos 3 días. Si el CSV se borraba
+        # (reinicio) y la última sincronización había sido hace más de
+        # 3 días, TODO el historial más viejo quedaba invisible en el
+        # calendario/reporte (mostrando "Falta" en días que sí se
+        # habían marcado) — aunque seguía sano y salvo en Supabase,
+        # como prueban las fotos. Ahora, si el CSV local está vacío
+        # (arranque en frío / recién reiniciado), se trae el HISTORIAL
+        # COMPLETO en vez de solo 3 días, para que se autorepare solo
+        # en el próximo reinicio.
+        if df_local_previo.empty or forzar_completo:
+            desde = "2000-01-01"
+        else:
+            desde = (hoy_peru() - timedelta(days=3)).strftime("%Y-%m-%d")
+
+        # 2) Llamada de red a Supabase — FUERA del bloqueo, para no
+        # dejar a otras sesiones esperando mientras dura la conexión.
+        res = (
+            supabase.table("marcaciones_efimeras")
+            .select("*")
+            .eq("empresa_id", str(empresa_id))
+            .gte("fecha", desde)
+            .execute()
+        )
+        registros_nube = res.data or []
+        if not registros_nube:
+            st.session_state["_ultima_sync_hubo_cambios"] = False
+            return df_local_previo
+
+        # 3) Recién acá se toma el bloqueo, y SOLO para leer de nuevo
+        # (por si cambió mientras se esperaba la respuesta de la red)
+        # y escribir — la parte rápida, sin red de por medio.
         with bloqueo_csv(CSV_ASISTENCIA):
             existe_archivo = os.path.exists(CSV_ASISTENCIA)
             if existe_archivo:
                 df_local = pd.read_csv(CSV_ASISTENCIA)
             else:
                 df_local = pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
-
-            # BUG GRAVE YA CORREGIDO: el CSV local vive en
-            # almacenamiento EFÍMERO — se borra solo cada vez que la
-            # app se reinicia o se redespliega. Antes, pasara lo que
-            # pasara, esta función solo traía de Supabase los últimos
-            # 3 días. Si el CSV se borraba (reinicio) y la última
-            # sincronización había sido hace más de 3 días, TODO el
-            # historial más viejo quedaba invisible en el calendario/
-            # reporte (mostrando "Falta" en días que sí se habían
-            # marcado) — aunque seguía sano y salvo en Supabase, como
-            # prueban las fotos. Ahora, si el CSV local está vacío
-            # (arranque en frío / recién reiniciado), se trae el
-            # HISTORIAL COMPLETO en vez de solo 3 días, para que se
-            # autorepare solo en el próximo reinicio.
-            if df_local.empty or forzar_completo:
-                desde = "2000-01-01"
-            else:
-                desde = (hoy_peru() - timedelta(days=3)).strftime(
-                    "%Y-%m-%d"
-                )
-            res = (
-                supabase.table("marcaciones_efimeras")
-                .select("*")
-                .eq("empresa_id", str(empresa_id))
-                .gte("fecha", desde)
-                .execute()
-            )
-            registros_nube = res.data or []
-            if not registros_nube:
-                st.session_state["_ultima_sync_hubo_cambios"] = False
-                return df_local
 
             existentes = set()
             if not df_local.empty:
