@@ -6183,43 +6183,75 @@ def _descargar_foto_storage(nombre_foto):
         return None
 
 
-def render_avatar_with_zoom(foto_path, index_id):
-    contenido_foto = None
+@st.cache_data(ttl=1800, show_spinner=False)
+def _obtener_url_firmada_foto(nombre_foto):
+    """Genera una URL firmada (temporal, dura 1 hora) para que el
+    NAVEGADOR cargue la foto directo desde Supabase Storage, sin que
+    el servidor de Streamlit tenga que descargarla ni procesarla. Se
+    cachea 30 minutos para no pedir una URL nueva cada vez que se
+    vuelve a dibujar la Bitácora."""
+    if not supabase or not nombre_foto:
+        return None
+    try:
+        resp = supabase.storage.from_("fotos-asistencia").create_signed_url(
+            nombre_foto, 3600
+        )
+        if isinstance(resp, dict):
+            return resp.get("signedURL") or resp.get("signed_url")
+        return (
+            getattr(resp, "signedURL", None)
+            or getattr(resp, "signed_url", None)
+        )
+    except Exception:
+        return None
 
-    if foto_path and not pd.isna(foto_path):
+
+def render_avatar_with_zoom(foto_path, index_id):
+    # FIX DE RENDIMIENTO GRAVE (causa real de "La página no responde"):
+    # antes esta función DESCARGABA cada foto completa desde Supabase
+    # Storage (una por una, en el servidor) y la incrustaba DOS VECES
+    # (miniatura + versión ampliada) como texto base64 dentro del
+    # HTML. Para un mes con ~40-60 marcaciones, eso generaba decenas
+    # de MB de HTML de una sola vez — el navegador literalmente se
+    # congelaba intentando pintarlo, sin que fuera un problema de
+    # lentitud del servidor o de Supabase. Ahora se usa una URL
+    # firmada como src de la imagen: el navegador la carga solo, de
+    # forma asíncrona, en segundo plano y con caché — exactamente
+    # como cualquier imagen normal de una página web.
+    if not foto_path or pd.isna(foto_path):
+        return "<span style='color: #6c757d;'>—</span>"
+
+    nombre_foto = os.path.basename(str(foto_path))
+    url_foto = _obtener_url_firmada_foto(nombre_foto)
+
+    if not url_foto:
+        # Respaldo: si no se pudo conseguir la URL firmada (Supabase
+        # caído, o la foto no existe ahí) pero el archivo SÍ sigue en
+        # el disco local (poco común, ya que se borra en cada
+        # reinicio), se muestra igual como antes.
         if os.path.exists(str(foto_path)):
             try:
                 with open(str(foto_path), "rb") as image_file:
                     contenido_foto = image_file.read()
+                encoded_string = base64.b64encode(contenido_foto).decode(
+                    "utf-8"
+                )
+                url_foto = f"data:image/png;base64,{encoded_string}"
             except Exception:
-                contenido_foto = None
+                return "<span style='color: #6c757d;'>—</span>"
+        else:
+            return "<span style='color: #6c757d;'>—</span>"
 
-        if contenido_foto is None:
-            # El archivo ya no está en el disco local (se borra en cada
-            # reboot/redespliegue) — se intenta traer desde Supabase
-            # Storage, donde sí queda guardado de forma permanente.
-            contenido_foto = _descargar_foto_storage(foto_path)
-
-    if not contenido_foto:
-        return "<span style='color: #6c757d;'>—</span>"
-
-    try:
-        encoded_string = base64.b64encode(contenido_foto).decode("utf-8")
-
-        img_src = f"data:image/png;base64,{encoded_string}"
-        modal_id = f"img-modal-{index_id}"
-
-        return (
-            f'<a href="#{modal_id}"><img src="{img_src}"'
-            ' class="user-avatar-thumb" title="Clic para ampliar" /></a><div'
-            f' id="{modal_id}" class="img-modal-backdrop"><a href="#_"'
-            ' class="img-modal-close-overlay"></a><div'
-            ' class="img-modal-content"><a href="#_" class="img-modal-close"'
-            f' title="Cerrar (ESC)">✕</a><img src="{img_src}" /></div></div>'
-        )
-    except Exception:
-        return "<span style='color: #6c757d;'>—</span>"
-
+    modal_id = f"img-modal-{index_id}"
+    return (
+        f'<a href="#{modal_id}"><img src="{url_foto}" loading="lazy"'
+        ' class="user-avatar-thumb" title="Clic para ampliar" /></a><div'
+        f' id="{modal_id}" class="img-modal-backdrop"><a href="#_"'
+        ' class="img-modal-close-overlay"></a><div'
+        ' class="img-modal-content"><a href="#_" class="img-modal-close"'
+        f' title="Cerrar (ESC)">✕</a><img src="{url_foto}"'
+        ' loading="lazy" /></div></div>'
+    )
 
 def render_custom_table(lista_registros):
     html_lines = [
@@ -8999,19 +9031,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                     f" **Sedes Habilitadas:** {s_aut_str}"
                 )
 
-                # DIAGNÓSTICO TEMPORAL: si el último guardado/borrado en
-                # "Edición Individual" dejó un desglose de tiempos
-                # pendiente de mostrar (se guardó así porque el rerun lo
-                # habría borrado antes de que se pudiera leer), se
-                # muestra acá, bien arriba, apenas se recarga la
-                # página.
-                if st.session_state.get("_diagnostico_tiempos_edicion"):
-                    st.success(
-                        st.session_state.pop(
-                            "_diagnostico_tiempos_edicion"
-                        )
-                    )
-
                 es_autorizado_edicion = (
                     st.session_state.rol in ["admin", "master"]
                     or st.session_state.entorno == "DEV"
@@ -9468,7 +9487,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         )
 
                                     if st.button("💾 Guardar Ajuste Manual"):
-                                        _t0_guardar = _tiempo_monotonico()
                                         with bloqueo_csv(CSV_ASISTENCIA):
                                             df_asist_fresco = (
                                                 pd.read_csv(CSV_ASISTENCIA)
@@ -9618,8 +9636,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 CSV_ASISTENCIA, index=False
                                             )
 
-                                        _t1_guardar_local = _tiempo_monotonico()
-
                                         # FIX CLAVE: la app sincroniza
                                         # cada pocos segundos desde
                                         # Supabase (tabla
@@ -9633,7 +9649,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         # cuántas veces se limpiara el
                                         # CSV local. Se borra también en
                                         # Supabase para que no vuelva.
-                                        _sup_ok = True
                                         if supabase:
                                             try:
                                                 with st.spinner(
@@ -9655,7 +9670,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                         "tipo", tipo_a_editar
                                                     ).execute()
                                             except Exception as _e_sup_del:
-                                                _sup_ok = False
                                                 st.warning(
                                                     "Se guardó local, pero no"
                                                     " se pudo limpiar el"
@@ -9665,35 +9679,10 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     " próxima sincronización."
                                                 )
 
-                                        _t2_guardar_supabase = (
-                                            _tiempo_monotonico()
-                                        )
-                                        # DIAGNÓSTICO TEMPORAL: se guarda
-                                        # el desglose de tiempos en
-                                        # session_state (no en un
-                                        # st.success normal, porque el
-                                        # st.rerun() de abajo lo borraría
-                                        # antes de que se alcance a leer)
-                                        # para mostrarlo recién arriba de
-                                        # esta pantalla, ya en el próximo
-                                        # render — así se puede saber
-                                        # EXACTAMENTE qué paso es el
-                                        # lento la próxima vez que se
-                                        # trabe, sin adivinar. Quitar
-                                        # este bloque de diagnóstico una
-                                        # vez identificado el cuello de
-                                        # botella real.
-                                        st.session_state[
-                                            "_diagnostico_tiempos_edicion"
-                                        ] = (
+                                        st.success(
                                             f"Registro de {tipo_a_editar} del"
                                             f" día {f_edit_sel} guardado"
-                                            " (limpio, sin duplicados). ⏱️"
-                                            " Local:"
-                                            f" {_t1_guardar_local - _t0_guardar:.2f}s"
-                                            " · Supabase:"
-                                            f" {_t2_guardar_supabase - _t1_guardar_local:.2f}s"
-                                            f" {'✅' if _sup_ok else '⚠️'}"
+                                            " (limpio, sin duplicados)."
                                         )
                                         st.rerun()
 
@@ -9732,7 +9721,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             " marcar)",
                                             disabled=not _confirmar_borrado,
                                         ):
-                                            _t0_borrar = _tiempo_monotonico()
                                             with bloqueo_csv(CSV_ASISTENCIA):
                                                 df_asist_borrar = (
                                                     pd.read_csv(CSV_ASISTENCIA)
@@ -9791,10 +9779,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     index=False,
                                                 )
 
-                                            _t1_borrar_local = (
-                                                _tiempo_monotonico()
-                                            )
-
                                             # FIX CLAVE: igual que en
                                             # "Guardar Ajuste Manual" — si
                                             # no se borra también en
@@ -9804,7 +9788,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                             # a traer este mismo registro
                                             # desde la nube y "resucita"
                                             # lo que se acaba de borrar.
-                                            _sup_ok_borrar = True
                                             if supabase:
                                                 try:
                                                     with st.spinner(
@@ -9826,7 +9809,6 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                             "tipo", tipo_a_editar
                                                         ).execute()
                                                 except Exception as _e_sup_del2:
-                                                    _sup_ok_borrar = False
                                                     st.warning(
                                                         "Se borró local, pero"
                                                         " no se pudo borrar"
@@ -9837,29 +9819,13 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                         " sincronización."
                                                     )
 
-                                            _t2_borrar_supabase = (
-                                                _tiempo_monotonico()
-                                            )
-                                            # DIAGNÓSTICO TEMPORAL: igual
-                                            # que en "Guardar Ajuste
-                                            # Manual" — se guarda en
-                                            # session_state porque el
-                                            # rerun de abajo borraría un
-                                            # st.success normal antes de
-                                            # poder leerlo.
-                                            st.session_state[
-                                                "_diagnostico_tiempos_edicion"
-                                            ] = (
+                                            st.success(
                                                 f"Marcación de"
                                                 f" {tipo_a_editar} del"
                                                 f" {f_edit_sel} borrada."
                                                 f" {emp_ind_sel} ya puede"
                                                 " volver a marcarla desde"
-                                                " la app. ⏱️ Local:"
-                                                f" {_t1_borrar_local - _t0_borrar:.2f}s"
-                                                " · Supabase:"
-                                                f" {_t2_borrar_supabase - _t1_borrar_local:.2f}s"
-                                                f" {'✅' if _sup_ok_borrar else '⚠️'}"
+                                                " la app."
                                             )
                                             st.rerun()
                                 else:
