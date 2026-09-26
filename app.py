@@ -5249,6 +5249,7 @@ def _procesar_auto_marcado_planilla(empresa_id, _df_sedes, _df_empleados):
                 ("Salida", h_sal_am),
             ):
                 nuevos_am.append({
+                    "_dni": str(_emp_am["dni"]),
                     "empresa_id": empresa_id,
                     "Fecha": hoy_am_str,
                     "Empleado": _emp_am["nombre"],
@@ -5275,14 +5276,49 @@ def _procesar_auto_marcado_planilla(empresa_id, _df_sedes, _df_empleados):
                 if os.path.exists(CSV_ASISTENCIA)
                 else pd.DataFrame(columns=COLUMNAS_ASISTENCIA)
             )
+            df_nuevos_am = pd.DataFrame(nuevos_am)
             df_asist_hoy_am = pd.concat(
-                [df_asist_hoy_am, pd.DataFrame(nuevos_am)],
+                [df_asist_hoy_am, df_nuevos_am[COLUMNAS_ASISTENCIA]],
                 ignore_index=True,
             )
             df_asist_hoy_am.to_csv(CSV_ASISTENCIA, index=False)
 
-    return cant_am
+        # FIX CRÍTICO (pérdida de datos real ya ocurrida en otras
+        # herramientas de regularización): se guarda también en
+        # Supabase, no solo en el archivo local efímero, para que el
+        # auto-marcado quede a salvo de inmediato sin importar qué le
+        # pase después al servidor (reinicio, redespliegue, etc.).
+        if supabase:
+            try:
+                _lote_nube_am = [
+                    {
+                        "empresa_id": r["empresa_id"],
+                        "dni": r["_dni"],
+                        "nombre": r["Empleado"],
+                        "tipo": r["Tipo Marcación"],
+                        "fecha": r["Fecha"],
+                        "hora_registrada": r["Hora Registrada"],
+                        "hora_entrada_oficial": r[
+                            "Hora Entrada Oficial"
+                        ],
+                        "hora_salida_oficial": r["Hora Salida Oficial"],
+                        "estado": r["Estado"],
+                        "minutos_tardanza": r["Minutos Tardanza"],
+                        "horas_extra_min": r["Horas Extra (min)"],
+                        "sede_detectada": r["Sede Detectada"],
+                        "distancia_m": r["Distancia (m)"],
+                        "en_rango": r["En Rango"],
+                        "foto_url": r["Foto"],
+                    }
+                    for r in nuevos_am
+                ]
+                supabase.table("marcaciones_efimeras").insert(
+                    _lote_nube_am
+                ).execute()
+            except Exception:
+                pass  # se reintentará solo en el próximo minuto
 
+    return cant_am
 
 
 # BARRA LATERAL: ENTORNO Y CAMBIO RÁPIDO
@@ -9208,11 +9244,119 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                         df_asist_all.to_csv(
                                             CSV_ASISTENCIA, index=False
                                         )
-                                    st.success(
-                                        f"¡Se regularizaron {cant_creados} días"
-                                        " como Puntual para"
-                                        f" {emp_ind_sel}!"
-                                    )
+
+                                    # FIX CRÍTICO (pérdida de datos real
+                                    # ya ocurrida): antes esto SOLO se
+                                    # guardaba en el archivo local, que
+                                    # es efímero — se borra solo cada
+                                    # vez que el servidor se reinicia
+                                    # (pasa cada ~12h sin uso, o en
+                                    # cualquier redespliegue). Si el
+                                    # servidor se reiniciaba antes de
+                                    # que alguien "capturara" estos
+                                    # datos de otra forma, la
+                                    # regularización completa se
+                                    # perdía sin aviso. Ahora se manda
+                                    # también a Supabase, en un solo
+                                    # lote (mucho más rápido que uno
+                                    # por uno), para que quede a salvo
+                                    # de inmediato sin importar qué le
+                                    # pase después al servidor.
+                                    if supabase:
+                                        try:
+                                            with st.spinner(
+                                                "Guardando de forma"
+                                                " permanente en la"
+                                                " nube..."
+                                            ):
+                                                _lote_nube_reg = [
+                                                    {
+                                                        "empresa_id": r[
+                                                            "empresa_id"
+                                                        ],
+                                                        "dni": str(
+                                                            emp_info["dni"]
+                                                        ),
+                                                        "nombre": r[
+                                                            "Empleado"
+                                                        ],
+                                                        "tipo": r[
+                                                            "Tipo Marcación"
+                                                        ],
+                                                        "fecha": r["Fecha"],
+                                                        "hora_registrada": r[
+                                                            "Hora Registrada"
+                                                        ],
+                                                        "hora_entrada_oficial": r[
+                                                            "Hora Entrada"
+                                                            " Oficial"
+                                                        ],
+                                                        "hora_salida_oficial": r[
+                                                            "Hora Salida"
+                                                            " Oficial"
+                                                        ],
+                                                        "estado": r[
+                                                            "Estado"
+                                                        ],
+                                                        "minutos_tardanza": r[
+                                                            "Minutos"
+                                                            " Tardanza"
+                                                        ],
+                                                        "horas_extra_min": r[
+                                                            "Horas Extra"
+                                                            " (min)"
+                                                        ],
+                                                        "sede_detectada": r[
+                                                            "Sede"
+                                                            " Detectada"
+                                                        ],
+                                                        "distancia_m": r[
+                                                            "Distancia (m)"
+                                                        ],
+                                                        "en_rango": r[
+                                                            "En Rango"
+                                                        ],
+                                                        "foto_url": r[
+                                                            "Foto"
+                                                        ],
+                                                    }
+                                                    for r in (
+                                                        nuevos_registros_regularizados
+                                                    )
+                                                ]
+                                                supabase.table(
+                                                    "marcaciones_efimeras"
+                                                ).insert(
+                                                    _lote_nube_reg
+                                                ).execute()
+                                            st.success(
+                                                f"¡Se regularizaron"
+                                                f" {cant_creados} días como"
+                                                f" Puntual para"
+                                                f" {emp_ind_sel}, guardado"
+                                                " de forma permanente en la"
+                                                " nube!"
+                                            )
+                                        except Exception as _e_reg_nube:
+                                            st.warning(
+                                                "Se guardó localmente, pero"
+                                                " no se pudo guardar en la"
+                                                f" nube ({_e_reg_nube})."
+                                                " Se perderá si el servidor"
+                                                " se reinicia antes de"
+                                                " intentarlo de nuevo."
+                                            )
+                                    else:
+                                        st.warning(
+                                            "⚠️ Supabase no está disponible"
+                                            " ahora mismo — esta"
+                                            " regularización SOLO quedó en"
+                                            " el archivo local y se"
+                                            " perderá si el servidor se"
+                                            " reinicia. Vuelve a intentarlo"
+                                            " cuando Supabase esté"
+                                            " disponible."
+                                        )
                                     st.rerun()
                                 else:
                                     st.info(
@@ -9636,23 +9780,27 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                 CSV_ASISTENCIA, index=False
                                             )
 
-                                        # FIX CLAVE: la app sincroniza
-                                        # cada pocos segundos desde
-                                        # Supabase (tabla
-                                        # marcaciones_efimeras) hacia el
-                                        # CSV local — si el registro
-                                        # original (ej. la Tardanza de
-                                        # las 14:05) seguía existiendo
-                                        # ALLÁ, la próxima sincronización
-                                        # lo volvía a traer y "resucitaba"
-                                        # el duplicado, sin importar
-                                        # cuántas veces se limpiara el
-                                        # CSV local. Se borra también en
-                                        # Supabase para que no vuelva.
+                                        # FIX CRÍTICO (pérdida de datos
+                                        # real ya ocurrida): antes esto
+                                        # solo BORRABA el registro viejo
+                                        # en Supabase, pero nunca
+                                        # guardaba ahí el corregido —
+                                        # solo quedaba en el archivo
+                                        # local, que es efímero (se
+                                        # borra solo cada reinicio del
+                                        # servidor). Si el servidor se
+                                        # reiniciaba antes de la
+                                        # siguiente sincronización real,
+                                        # este ajuste desaparecía sin
+                                        # aviso. Ahora se borra Y se
+                                        # vuelve a insertar el
+                                        # registro correcto, para que
+                                        # quede a salvo de inmediato.
                                         if supabase:
                                             try:
                                                 with st.spinner(
-                                                    "Sincronizando con la"
+                                                    "Guardando de forma"
+                                                    " permanente en la"
                                                     " nube..."
                                                 ):
                                                     supabase.table(
@@ -9669,14 +9817,103 @@ elif opcion == "🔐 Panel de Gestión / Admin":
                                                     ).eq(
                                                         "tipo", tipo_a_editar
                                                     ).execute()
+                                                    supabase.table(
+                                                        "marcaciones_efimeras"
+                                                    ).insert({
+                                                        "empresa_id": (
+                                                            _nueva_fila[
+                                                                "empresa_id"
+                                                            ]
+                                                        ),
+                                                        "dni": str(
+                                                            emp_info["dni"]
+                                                        ),
+                                                        "nombre": (
+                                                            _nueva_fila[
+                                                                "Empleado"
+                                                            ]
+                                                        ),
+                                                        "tipo": (
+                                                            _nueva_fila[
+                                                                "Tipo"
+                                                                " Marcación"
+                                                            ]
+                                                        ),
+                                                        "fecha": (
+                                                            _nueva_fila[
+                                                                "Fecha"
+                                                            ]
+                                                        ),
+                                                        "hora_registrada": (
+                                                            _nueva_fila[
+                                                                "Hora"
+                                                                " Registrada"
+                                                            ]
+                                                        ),
+                                                        "hora_entrada_oficial": (
+                                                            _nueva_fila[
+                                                                "Hora"
+                                                                " Entrada"
+                                                                " Oficial"
+                                                            ]
+                                                        ),
+                                                        "hora_salida_oficial": (
+                                                            _nueva_fila[
+                                                                "Hora"
+                                                                " Salida"
+                                                                " Oficial"
+                                                            ]
+                                                        ),
+                                                        "estado": (
+                                                            _nueva_fila[
+                                                                "Estado"
+                                                            ]
+                                                        ),
+                                                        "minutos_tardanza": (
+                                                            _nueva_fila[
+                                                                "Minutos"
+                                                                " Tardanza"
+                                                            ]
+                                                        ),
+                                                        "horas_extra_min": (
+                                                            _nueva_fila[
+                                                                "Horas"
+                                                                " Extra"
+                                                                " (min)"
+                                                            ]
+                                                        ),
+                                                        "sede_detectada": (
+                                                            _nueva_fila[
+                                                                "Sede"
+                                                                " Detectada"
+                                                            ]
+                                                        ),
+                                                        "distancia_m": (
+                                                            _nueva_fila[
+                                                                "Distancia"
+                                                                " (m)"
+                                                            ]
+                                                        ),
+                                                        "en_rango": (
+                                                            _nueva_fila[
+                                                                "En Rango"
+                                                            ]
+                                                        ),
+                                                        "foto_url": (
+                                                            _nueva_fila[
+                                                                "Foto"
+                                                            ]
+                                                        ),
+                                                    }).execute()
                                             except Exception as _e_sup_del:
                                                 st.warning(
                                                     "Se guardó local, pero no"
-                                                    " se pudo limpiar el"
-                                                    " registro original en"
-                                                    f" la nube ({_e_sup_del})."
-                                                    " Podría resucitar en la"
-                                                    " próxima sincronización."
+                                                    " se pudo guardar en la"
+                                                    f" nube ({_e_sup_del})."
+                                                    " Se perderá si el"
+                                                    " servidor se reinicia"
+                                                    " antes de intentarlo de"
+                                                    " nuevo."
                                                 )
 
                                         st.success(
