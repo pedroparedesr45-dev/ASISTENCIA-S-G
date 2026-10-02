@@ -406,6 +406,133 @@ def capturar_foto_camara_alternativa(key=None):
     return archivo
 
 
+
+# =====================================================================
+# GPS ALTERNATIVO (Custom Component v2) — respaldo para cuando
+# streamlit_js_eval (la librería externa que se usa normalmente para
+# el GPS automático) no logra el permiso de ubicación. Esto pasa
+# seguido en Safari/iPhone por DOS motivos técnicos reales:
+#   1) streamlit_js_eval tiene una limitación documentada por su
+#      propio autor: falla si se llama dentro de un bloque
+#      condicional de Streamlit (if/else, como aquí, donde depende de
+#      si ya se tomó la foto) — https://pypi.org/project/streamlit-js-eval
+#   2) Safari es mucho más estricto pidiendo geolocalización cuando la
+#      petición NO ocurre dentro del mismo clic/toque del usuario —
+#      nuestro botón "Reintentar" de antes solo disparaba un st.rerun(),
+#      y recién en la vuelta del servidor se volvía a pedir el GPS: para
+#      Safari eso ya no cuenta como "gesto del usuario", así que puede
+#      denegarlo en silencio otra vez.
+# Este componente pide el GPS DIRECTAMENTE dentro del evento de clic del
+# botón, sin pasar antes por el servidor — el permiso se pide "de
+# verdad" en el momento correcto, que es justo lo que Safari exige.
+# =====================================================================
+_GPS_ALT_DISPONIBLE = hasattr(st.components, "v2")
+
+if _GPS_ALT_DISPONIBLE:
+    _GPS_ALT_HTML = """
+    <div id="gpswrap" style="max-width:100%;">
+      <div id="gpsstatus" style="font-size:0.85rem;color:#9aa4b2;
+           margin-bottom:8px;">
+        📍 Toca el botón para compartir tu ubicación
+      </div>
+      <button id="btngps" type="button"
+              style="width:100%;padding:12px;border-radius:8px;border:none;
+                     background:#3b82f6;color:white;font-weight:600;
+                     cursor:pointer;font-size:0.95rem;">
+        📍 Obtener mi ubicación GPS
+      </button>
+    </div>
+    """
+
+    _GPS_ALT_JS = """
+    export default function(component) {
+      const { setTriggerValue, parentElement } = component;
+      const btn = parentElement.querySelector('#btngps');
+      const status = parentElement.querySelector('#gpsstatus');
+
+      btn.onclick = () => {
+        // CLAVE: esta llamada ocurre DENTRO del mismo evento de clic
+        // del usuario, sin ida y vuelta al servidor antes — así
+        // Safari la trata como un permiso pedido de verdad por la
+        // persona, no como una petición automática en segundo plano.
+        status.textContent = '⏳ Obteniendo tu ubicación...';
+        btn.disabled = true;
+
+        if (!navigator.geolocation) {
+          status.textContent =
+            '❌ Este navegador no soporta geolocalización.';
+          btn.disabled = false;
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            status.textContent = '✅ Ubicación obtenida correctamente.';
+            setTriggerValue('coords', JSON.stringify({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+            }));
+          },
+          (err) => {
+            const msg =
+              'No se pudo obtener tu ubicación (' +
+              (err.message || ('código ' + err.code)) + ').';
+            status.textContent = '❌ ' + msg;
+            btn.disabled = false;
+            setTriggerValue('error', msg);
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      };
+    }
+    """
+
+    _gps_alternativo_component = st.components.v2.component(
+        "gps_alternativo_marcacion",
+        html=_GPS_ALT_HTML,
+        js=_GPS_ALT_JS,
+    )
+
+
+def obtener_gps_alternativo(key=None):
+    """Widget de GPS alternativo (Custom Component v2) para cuando el
+    intento automático (streamlit_js_eval) no logra el permiso de
+    ubicación — pensado sobre todo para Safari/iPhone. Pide el GPS
+    directamente dentro del clic del botón, sin pasar antes por el
+    servidor. Devuelve un dict {'coords': {'latitude':.., 'longitude':..}}
+    (mismo formato que get_geolocation), o None si todavía no se tocó
+    el botón, si dio error, o si esta versión de Streamlit no tiene
+    Components v2 (anterior a 1.51.0) — en ese caso no se muestra nada,
+    la app sigue funcionando igual que antes.
+    """
+    if not _GPS_ALT_DISPONIBLE:
+        return None
+    try:
+        resultado = _gps_alternativo_component(
+            on_coords_change=lambda: None,
+            on_error_change=lambda: None,
+            key=key,
+        )
+    except Exception as _e_gps_alt:
+        logger.warning(
+            f"GPS alternativo no disponible en este entorno: {_e_gps_alt}"
+        )
+        return None
+
+    coords_json = getattr(resultado, "coords", None)
+    if coords_json:
+        try:
+            coords = json.loads(coords_json)
+            return {
+                "coords": {
+                    "latitude": coords["latitude"],
+                    "longitude": coords["longitude"],
+                }
+            }
+        except Exception:
+            return None
+    return None
+
 def enviar_marcacion_supabase(empresa_id, dni, nombre, fecha, hora, tipo, foto_url="", gps=""):
     if not supabase:
         return False
@@ -5135,6 +5262,37 @@ def cargar_datos(empresa_id):
     return df_sedes_emp, df_empleados_emp, df_asistencia_emp
 
 
+def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
+    nombre_dia = DIAS_SEMANA_MAP[fecha_obj.weekday()]
+    horario_json = emp_row.get("horario_personalizado", "{}")
+    if pd.notna(horario_json) and str(horario_json).strip() != "":
+        try:
+            h_dict = json.loads(str(horario_json))
+            if nombre_dia in h_dict and h_dict[nombre_dia].get("activo", False):
+                return (
+                    h_dict[nombre_dia]["entrada"],
+                    h_dict[nombre_dia]["salida"],
+                )
+        except Exception as _e_silenciosa:
+            logger.warning(f"Error controlado (ignorado para el usuario): {_e_silenciosa}")
+
+    sede_emp = emp_row["sede_principal"]
+    datos_sede = df_sedes[df_sedes["nombre_sede"] == sede_emp]
+
+    h_ent = (
+        datos_sede["hora_entrada"].values[0]
+        if not datos_sede.empty
+        else "08:00:00"
+    )
+    h_sal = (
+        datos_sede["hora_salida"].values[0]
+        if not datos_sede.empty
+        else "17:00:00"
+    )
+    return h_ent, h_sal
+
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _procesar_auto_marcado_planilla(empresa_id, _df_sedes, _df_empleados):
     """Para el personal de planilla que no usa el reloj biométrico:
@@ -5625,35 +5783,6 @@ _CACHE_HASH_FUNCS_PANDAS = {
     pd.Series: _hash_pandas_rapido,
 }
 
-
-def obtener_horario_oficial(emp_row, df_sedes, fecha_obj):
-    nombre_dia = DIAS_SEMANA_MAP[fecha_obj.weekday()]
-    horario_json = emp_row.get("horario_personalizado", "{}")
-    if pd.notna(horario_json) and str(horario_json).strip() != "":
-        try:
-            h_dict = json.loads(str(horario_json))
-            if nombre_dia in h_dict and h_dict[nombre_dia].get("activo", False):
-                return (
-                    h_dict[nombre_dia]["entrada"],
-                    h_dict[nombre_dia]["salida"],
-                )
-        except Exception as _e_silenciosa:
-            logger.warning(f"Error controlado (ignorado para el usuario): {_e_silenciosa}")
-
-    sede_emp = emp_row["sede_principal"]
-    datos_sede = df_sedes[df_sedes["nombre_sede"] == sede_emp]
-
-    h_ent = (
-        datos_sede["hora_entrada"].values[0]
-        if not datos_sede.empty
-        else "08:00:00"
-    )
-    h_sal = (
-        datos_sede["hora_salida"].values[0]
-        if not datos_sede.empty
-        else "17:00:00"
-    )
-    return h_ent, h_sal
 
 
 def calcular_horas_trabajadas_periodo(
@@ -8355,14 +8484,25 @@ if opcion == "⏰ Marcar Asistencia":
                         " seguido en Safari: ve a Ajustes → Privacidad y"
                         " Seguridad → Localización → Safari (Apps"
                         " Websites) y confirma que esté en 'Preguntar' o"
-                        " 'Mientras se usa la app'. Luego toca abajo"
-                        " para volver a intentar."
+                        " 'Mientras se usa la app'."
                     )
-                    if st.button("🔄 Reintentar obtener mi ubicación"):
-                        st.session_state.ubicacion_marcacion_lista = False
-                        st.session_state.pop(
-                            "ubicacion_marcacion_actual", None
+                    # FIX DE RAÍZ: antes este botón solo hacía un
+                    # st.rerun(), que volvía a intentar con la MISMA
+                    # librería externa (streamlit_js_eval) — en Safari
+                    # eso casi nunca funciona, porque para cuando el
+                    # servidor responde ya no cuenta como "gesto del
+                    # usuario" y el permiso se puede denegar en
+                    # silencio otra vez. Ahora se usa un componente
+                    # propio que pide el GPS DENTRO del mismo clic del
+                    # botón — mucho más confiable en Safari/iPhone.
+                    _gps_alt_resultado = obtener_gps_alternativo(
+                        key=f"gps_alt_{datos_emp.get('dni', '')}"
+                    )
+                    if _gps_alt_resultado is not None:
+                        st.session_state.ubicacion_marcacion_actual = (
+                            _gps_alt_resultado
                         )
+                        st.session_state.ubicacion_marcacion_lista = True
                         st.rerun()
                 elif foto_ya_tomada:
                     st.warning(
