@@ -5382,8 +5382,14 @@ def _procesar_auto_marcado_planilla(empresa_id, _df_sedes, _df_empleados):
             except Exception:
                 continue
 
+            # FIX: datetime.combine() crea una hora "ingenua" (sin
+            # zona horaria), pero ahora_am (ahora_peru()) SÍ tiene
+            # zona horaria — Python no permite comparar una con zona
+            # horaria contra una sin ella (TypeError). Se le pone la
+            # misma zona horaria de la app para que la comparación
+            # funcione.
             _limite_am = datetime.combine(
-                hoy_am, _t_sal_am
+                hoy_am, _t_sal_am, tzinfo=ZONA_HORARIA_APP
             ) + timedelta(minutes=1)
             if ahora_am < _limite_am:
                 continue  # todavía no pasa 1 min de su hora de salida
